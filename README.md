@@ -1,4 +1,4 @@
-# DGLS (Dynamic GPU Layer Swapping) for ComfyUI
+# ComfyUI - DGLS (Dynamic GPU Layer Swapping) 
 
 Smart dynamic layer swapping between GPU and CPU for optimal inference performance with comprehensive mixed precision handling and copy-compute overlap optimization. Enables running much larger models on limited VRAM setups.
 
