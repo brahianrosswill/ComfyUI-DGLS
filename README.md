@@ -175,12 +175,13 @@ NOTE: All settings can be stacked together!
 - **Purpose**: Background thread for automatic layer management
 - **Benefit**: Better overlap of transfers with computation
 - **Note**: If you're using a smaller model or one with a fast compute per layer, threading may be counter productive as the swap will lag behind the fast compute. Instead increase resident GPU layers and prefetch
-- **Note**: May not work with all models, Flux can sometimes have issues. May cause instability in some systems.
+- **Note**: May cause instability in some systems
 
 **`cuda_streams`**
 - **Purpose**: CUDA streams for copy-compute overlap
 - **Requirement**: Additional VRAM for stream buffers
 - **Benefit**: Maximum performance when VRAM allows
+- **Note**: May not work with all models, Flux can sometimes have issues
 
 **`batch_move`**
 - **Purpose**: Move multiple layers simultaneously
