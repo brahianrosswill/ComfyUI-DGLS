@@ -267,7 +267,7 @@ class DGLSModelLoader:
         layers = model_patcher.to_layers()
 
         if verbose:
-            print(f"✅ Model loaded successfully")
+            print(f"Model loaded successfully")
             print(f"Total layers extracted: {len(layers)}")
 
             if len(layers) > 0:
@@ -282,3 +282,4 @@ class DGLSModelLoader:
                 print("========================\n")
 
         return (model_patcher, layers)
+
