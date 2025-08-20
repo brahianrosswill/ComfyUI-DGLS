@@ -61,7 +61,8 @@ class Args:
         self.cuda_streams = False    # Enable CUDA streams for copy-compute overlap (needs more VRAM)
         self.batch_move = False      # Use batch layer moving (experimental, may cause device issues)
         self.cast_target = None      # Cast FROM dtype TO dtype at start-up (e.g., f32 bf16)
-        self.selective_packing = 0   # Size threshold in MB for using packed transfers (default: 64MB)
+        self.selective_packing = False   # Size threshold in MB for using packed transfers (default: 64MB)
+        self.packing_threshold_mb = 64
         self.event_sync = False      # Use CUDA events instead of torch.cuda.synchronize() for better performance
         self.verbose = False         # Enable verbose output with detailed timing and transfer information
         self.device_sync_mode = 'off' # Not needed for inference
@@ -80,7 +81,7 @@ TOOLTIPS = {
     "final_gpu_layers": "Number of final layers to keep permanently on GPU",
     "gpu_layers": "Comma-separated list of layer indices to keep permanently on GPU (e.g., '0,1,2,14,18,19,20,21,22'). Overrides initial_gpu_layers and final_gpu_layers",
     "prefetch": "Number of layers to prefetch ahead (0=off, 1=single layer, 2+=multiple layers), might not work with mixed layer type models",
-    "threading": "Enable background threading for automatic layer management",
+    "threading": "Enable background threading for automatic layer management CAUTION: Can be unstable in some systems or with some models",
     "cuda_streams": "Enable CUDA streams for copy-compute overlap (needs more VRAM)",
     "batch_move": "Use batch layer moving (experimental, may cause device issues)",
     "cast_target": "Cast FROM dtype TO dtype at start-up (e.g., f32 bf16) choices=[f32, bf16, f16, f8_e4m3, f8_e5m2, nf4, fp4]", #DISABLED DUE TO COMFY AUTOCAST
@@ -197,7 +198,6 @@ class LayerDeviceCache:
         self.cache[layer_idx] = new_device
 
 
-
 def safe_move_to_cpu(layer, idx):
     """Move layer back to CPU and clean up GPU memory"""
     if PROFILE:
@@ -223,12 +223,12 @@ def safe_move_to_cpu(layer, idx):
             end_time = time.time()
             transfer_time = end_time - start_time
 
-        if transfer_time > 0 and VERBOSE:
-            speed_mbps = layer_size_mb / transfer_time
-
-            # Track current step stats
-            transfer_stats['current_step_cpu_times'].append(transfer_time)
-            transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
+        if VERBOSE:
+            if transfer_time > 0:
+                speed_mbps = layer_size_mb / transfer_time
+                # Track current step stats
+                transfer_stats['current_step_cpu_times'].append(transfer_time)
+                transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
 
         device_cache.mark_moved(idx, torch.device('cpu'))
 
@@ -263,11 +263,12 @@ def safe_move_to_gpu(layer, idx):
                 end_time = time.time()
                 transfer_time = end_time - start_time
 
-            if transfer_time > 0 and VERBOSE:
-                speed_mbps = layer_size_mb / transfer_time
-                # Track current step stats
-                transfer_stats['current_step_gpu_times'].append(transfer_time)
-                transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
+            if VERBOSE:
+                if transfer_time > 0:
+                    speed_mbps = layer_size_mb / transfer_time
+                    # Track current step stats
+                    transfer_stats['current_step_gpu_times'].append(transfer_time)
+                    transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
 
             event_based_sync("gpu_transfer", idx)
             device_cache.mark_moved(idx, torch.device('cuda'))
@@ -648,12 +649,13 @@ def batch_safe_move_to_cpu(layer_indices):
                     end_time = time.time()
                     transfer_time = end_time - start_time
 
-                if transfer_time > 0 and VERBOSE:
-                    speed_mbps = layer_size_mb / transfer_time
+                if VERBOSE:
+                    if transfer_time > 0:
+                        speed_mbps = layer_size_mb / transfer_time
+                        # Track current step stats
+                        transfer_stats['current_step_cpu_times'].append(transfer_time)
+                        transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
 
-                    # Track current step stats
-                    transfer_stats['current_step_cpu_times'].append(transfer_time)
-                    transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
                 device_cache.mark_moved(idx, torch.device('cpu'))
                 swap_stats['to_cpu'] += 1
                 moved_count += 1
@@ -692,11 +694,12 @@ def batch_safe_move_to_gpu(layer_indices):
                     transfer_time = end_time - start_time
 
                 event_based_sync("gpu_transfer", idx)
-                if transfer_time > 0 and VERBOSE:
-                    speed_mbps = layer_size_mb / transfer_time
-                    # Track current step stats
-                    transfer_stats['current_step_gpu_times'].append(transfer_time)
-                    transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
+                if VERBOSE:
+                    if transfer_time > 0:
+                        speed_mbps = layer_size_mb / transfer_time
+                        # Track current step stats
+                        transfer_stats['current_step_gpu_times'].append(transfer_time)
+                        transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
 
                 device_cache.mark_moved(idx, torch.device('cuda'))
                 swap_stats['to_gpu'] += 1
@@ -930,12 +933,13 @@ def safe_move_to_gpu_packed(layer, idx):
         if VERBOSE:
             end_time = time.time()
             transfer_time = end_time - start_time
-        if transfer_time > 0 and VERBOSE:
-            speed_mbps = layer_size_mb / transfer_time
+        if VERBOSE:
+            if transfer_time > 0:
+                speed_mbps = layer_size_mb / transfer_time
+                # Track current step stats
+                transfer_stats['current_step_gpu_times'].append(transfer_time)
+                transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
 
-            # Track current step stats
-            transfer_stats['current_step_gpu_times'].append(transfer_time)
-            transfer_stats['current_step_gpu_speeds'].append(speed_mbps)
         device_cache.mark_moved(idx, torch.device('cuda'))
         swap_stats['to_gpu'] += 1
         return True
@@ -972,11 +976,13 @@ def safe_move_to_cpu_packed(layer, idx):
             end_time = time.time()
             transfer_time = end_time - start_time
 
-        if transfer_time > 0 and VERBOSE:
-            speed_mbps = layer_size_mb / transfer_time
-            # Track current step stats
-            transfer_stats['current_step_cpu_times'].append(transfer_time)
-            transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
+        if VERBOSE:
+            if transfer_time > 0:
+                speed_mbps = layer_size_mb / transfer_time
+                # Track current step stats
+                transfer_stats['current_step_cpu_times'].append(transfer_time)
+                transfer_stats['current_step_cpu_speeds'].append(speed_mbps)
+
         device_cache.mark_moved(idx, torch.device('cpu'))
         swap_stats['to_cpu'] += 1
         return True
@@ -1026,10 +1032,17 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
 
     # CUDA STREAMS: Initialize streams (once) - only if enabled
     if args.cuda_streams and not hasattr(add_smart_swapping_to_layer, 'streams_initialized'):
-        add_smart_swapping_to_layer.streams_initialized = True
-        add_smart_swapping_to_layer.copy_stream = torch.cuda.Stream()
-        add_smart_swapping_to_layer.compute_stream = torch.cuda.Stream()
-        print(" CUDA Streams enabled for copy-compute overlap")
+        try:
+            add_smart_swapping_to_layer.streams_initialized = True
+            add_smart_swapping_to_layer.copy_stream = torch.cuda.Stream()
+            add_smart_swapping_to_layer.compute_stream = torch.cuda.Stream()
+            # Synchronize streams immediately after creation
+            torch.cuda.synchronize()
+            # print(" CUDA Streams enabled for copy-compute overlap")
+        except Exception as e:
+            print(f" CUDA Streams failed to initialize: {e}")
+            args.cuda_streams = False
+            print(" Falling back to default stream")
 
     # THREADING: Start background thread (once)
     if args.threading and add_smart_swapping_to_layer.background_thread is None:
@@ -1155,8 +1168,8 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                                     needed_layers = calculate_needed_layers(layer_idx, args.prefetch)
 
                                     if args.selective_packing:
-                                        cleaned = cleanup_excess_layers_packed(needed_layers, args.selective_packing)
-                                        fetched = fetch_missing_layers_packed(needed_layers, args.selective_packing)
+                                        cleaned = cleanup_excess_layers_packed(needed_layers, args.packing_threshold_mb)
+                                        fetched = fetch_missing_layers_packed(needed_layers, args.packing_threshold_mb)
                                     else:
                                         cleaned = cleanup_excess_layers(needed_layers)
                                         fetched = fetch_missing_layers(needed_layers)
@@ -1164,8 +1177,8 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                                 # No threading, run normally
                                 needed_layers = calculate_needed_layers(layer_idx, args.prefetch)
                                 if args.selective_packing:
-                                    cleaned = cleanup_excess_layers_packed(needed_layers, args.selective_packing)
-                                    fetched = fetch_missing_layers_packed(needed_layers, args.selective_packing)
+                                    cleaned = cleanup_excess_layers_packed(needed_layers, args.packing_threshold_mb)
+                                    fetched = fetch_missing_layers_packed(needed_layers, args.packing_threshold_mb)
                                 else:
                                     cleaned = cleanup_excess_layers(needed_layers)
                                     fetched = fetch_missing_layers(needed_layers)
@@ -1421,23 +1434,22 @@ class DynamicSwappingLoader:
                 "model": ("MODEL",),
                 "layers": ("LAYERS",),
                 "initial_gpu_layers": ("INT",
-                                       {"default": 2, "min": 0, "max": 50, "tooltip": TOOLTIPS["initial_gpu_layers"]}),
+                                       {"default": 2, "min": 0, "max": 100, "tooltip": TOOLTIPS["initial_gpu_layers"]}),
                 "final_gpu_layers": ("INT",
-                                     {"default": 2, "min": 0, "max": 50, "tooltip": TOOLTIPS["final_gpu_layers"]}),
+                                     {"default": 2, "min": 0, "max": 100, "tooltip": TOOLTIPS["final_gpu_layers"]}),
                 "prefetch": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["prefetch"]}),
                 "threading": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["threading"]}),
                 "event_sync": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["event_sync"]}),
                 "cuda_streams": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cuda_streams"]}),
                 "batch_move": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["batch_move"]}),
-                "selective_packing": ("INT",
-                                      {"default": 0, "min": 0, "max": 128, "tooltip": TOOLTIPS["selective_packing"]}),
+                "selective_packing": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["selective_packing"]}),
+                "packing_threshold_mb": ("INT", {"default": 64, "min": 0, "max": 1024, "tooltip": "Size threshold in MB for packed transfers when selective packing is enabled"}),
                 "verbose": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["verbose"]}),
                 "compile": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["compile"]}),
             },
             "optional": {
                 "gpu_layer_indices": ("STRING", {"default": "", "tooltip": TOOLTIPS["gpu_layers"]}),
-                #Precision tools have been disabled due to confliction with comfy auto precision and casting
-
+                #Precision tools have been disabled due to confliction with comfy auto precision and casting. need active testing but they are non essential
 
                 # "compute_casting": (["disabled", "fp32", "bf16", "fp16"],
                 #                     {"default": "disabled",
@@ -1460,12 +1472,13 @@ class DynamicSwappingLoader:
 
     def load_model_with_swapping(self, model, layers, initial_gpu_layers, final_gpu_layers,
                                  prefetch, threading, event_sync, cuda_streams, batch_move,
-                                 selective_packing, verbose, compile, compute_casting=False, gpu_layer_indices="",
+                                 selective_packing,packing_threshold_mb, verbose, compile, compute_casting=False, gpu_layer_indices="",
                                  cast_target="", autocast="", mixed_precision="auto"):
 
         # Force cleanup before starting
         torch.cuda.empty_cache()
         gc.collect()
+        torch.cuda.synchronize()
 
         global swap_stats, transfer_stats
         swap_stats = {'to_gpu': 0, 'to_cpu': 0}
@@ -1489,6 +1502,7 @@ class DynamicSwappingLoader:
         args.cuda_streams = cuda_streams
         args.batch_move = batch_move
         args.selective_packing = selective_packing
+        args.packing_threshold_mb = packing_threshold_mb
         args.event_sync = event_sync
         args.verbose = verbose
         global VERBOSE
@@ -1581,6 +1595,13 @@ class DynamicSwappingLoader:
                 if VERBOSE:
                     print(f"Using initial/final layer allocation: {initial_gpu_layers}/{final_gpu_layers}")
 
+
+            # if verbose:
+            #     print(f"DEBUG: specified_gpu_layers = {specified_gpu_layers}")
+            #     print(f"DEBUG: initial_gpu_layers = {initial_gpu_layers}")
+            #     print(f"DEBUG: final_gpu_layers = {final_gpu_layers}")
+            #     print(f"DEBUG: len(layers) = {len(layers)}")
+
             # PHASE 1: Determine which layers go where based on specified layers or initial/final counts
             for i, layer in enumerate(layers):
                 if hasattr(layer, 'to'):
@@ -1589,40 +1610,38 @@ class DynamicSwappingLoader:
                         if i in specified_gpu_layers:
                             try:
                                 layer.to(GPU_DEVICE)
-                                gpu_resident_layers.add(i)
-                                if VERBOSE:
+                                gpu_resident_layers.add(i)  # This is correct - after successful move
+                                if verbose:
                                     print(f"Layer {i} (specified) -> GPU permanent")
                             except RuntimeError as e:
-                                print(f" CRITICAL: Cannot fit specified layer {i} on GPU!")
+                                print(f"CRITICAL: Cannot fit specified layer {i} on GPU!")
                                 print(f"GPU memory may be insufficient. Consider removing layer {i} from --gpu_layers")
                                 raise e
                         else:
                             # Not in specified list, make swappable
                             layer.to(CPU_DEVICE)
                             cpu_swappable_layers.add(i)
-                            if VERBOSE:
+                            if verbose:
                                 print(f"Layer {i} (not specified) -> CPU swappable")
-
                     else:
                         # Use original initial/final logic as fallback
                         if i < initial_gpu_layers:
                             # Initial layers on GPU permanently
                             try:
                                 layer.to(GPU_DEVICE)
-                                gpu_resident_layers.add(i)
-                                if VERBOSE:
+                                gpu_resident_layers.add(i)  # MOVED: Only add if successful
+                                if verbose:
                                     print(f"Layer {i} (initial) -> GPU permanent")
                             except RuntimeError as e:
                                 print(f"GPU exhausted at layer {i}, moving to CPU with swapping")
                                 layer.to(CPU_DEVICE)
                                 cpu_swappable_layers.add(i)
-
                         elif i >= (len(layers) - final_gpu_layers):
                             # Final layers on GPU permanently
                             try:
                                 layer.to(GPU_DEVICE)
-                                gpu_resident_layers.add(i)
-                                if VERBOSE:
+                                gpu_resident_layers.add(i)  # MOVED: Only add if successful
+                                if verbose:
                                     print(f"Layer {i} (final) -> GPU permanent")
                             except RuntimeError as e:
                                 print(f"CRITICAL: Cannot fit final layer {i} on GPU!")
@@ -1631,10 +1650,17 @@ class DynamicSwappingLoader:
                             # Middle layers on CPU with swapping capability
                             layer.to(CPU_DEVICE)
                             cpu_swappable_layers.add(i)
-                            print(f"Layer {i} (middle) -> CPU swappable")
+                            if verbose:
+                                print(f"Layer {i} (middle) -> CPU swappable")
 
             print(f"✓ {len(gpu_resident_layers)} layers permanently on GPU: {sorted(gpu_resident_layers)}")
             print(f"✓ {len(cpu_swappable_layers)} layers on CPU with smart swapping: {sorted(cpu_swappable_layers)}")
+
+            # if verbose:
+            #     print(f"DEBUG: specified_gpu_layers = {specified_gpu_layers}")
+            #     print(f"DEBUG: initial_gpu_layers = {initial_gpu_layers}")
+            #     print(f"DEBUG: final_gpu_layers = {final_gpu_layers}")
+            #     print(f"DEBUG: len(layers) = {len(layers)}")
 
 
             if cast_target:
