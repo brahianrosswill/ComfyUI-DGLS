@@ -69,7 +69,7 @@ Next Layer:     [GPU: layers 0,1,3,4,5] [CPU: layers 2,6,7,...,19,20,21]
 - **Permanent Residents**: First/last layers stay on GPU for stability
 - **Sliding Window**: Middle layers swap dynamically based on computation needs
 - **Prefetching**: Next layers loaded while current layer computes
-- **Background Threading**: Synchronous transfers overlap with computation
+- **Background **: Synchronous transfers overlap with computation
 
 ## Node Usage
 
@@ -95,7 +95,7 @@ Next Layer:     [GPU: layers 0,1,3,4,5] [CPU: layers 2,6,7,...,19,20,21]
 - `prefetch`: Number of layers to prefetch ahead (0-4)
 
 **Optional Performance Settings**:
-- `threading`: Enable background threading for better overlap
+- `threading`: Enable background threading for better overlap (May not work with all models or systems)
 - `cuda_streams`: Enable CUDA streams (requires more VRAM)
 - `batch_move`: Move multiple layers simultaneously
 - `selective_packing`: Size threshold for packed transfers (MB)
@@ -174,6 +174,7 @@ NOTE: All settings can be stacked together!
 - **Purpose**: Background thread for automatic layer management
 - **Benefit**: Better overlap of transfers with computation
 - **Note**: If you're using a smaller model or one with a fast compute per layer, threading may be counter productive as the swap will lag behind the fast compute. Instead increase resident GPU layers and prefetch
+- **Note**: May not work with all models, Flux can sometimes have issues. May cause instability in some systems.
 
 **`cuda_streams`**
 - **Purpose**: CUDA streams for copy-compute overlap
