@@ -130,7 +130,8 @@ event_sync: True
 
 ### High Performance (16GB+ VRAM)
 ```
-gpu_layer_indices: "0,1,2,3,18,19,20,21,22"
+initial_gpu_layers: 5+
+final_gpu_layers: 5+
 prefetch: 3+
 threading: True
 cuda_streams: True
