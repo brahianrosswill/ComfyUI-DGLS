@@ -3,7 +3,7 @@ import folder_paths
 import torch
 from safetensors.torch import load_file
 import comfy.model_detection
-
+import gc
 """
 DGLS Model Loader for ComfyUI by obisin
 ============================
@@ -159,7 +159,7 @@ class DGLSModelLoader:
         return {
             "required": {
                 "model_name": (model_list, {"default": model_list[0] if model_list else ""}),
-                "model_type": (["default", "hunyuan"], {"default": "default"}),
+                "model_type": (["default", "hunyuan", "unet"], {"default": "default"}),
                 "cast_dtype": (["default", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
                                  {"default": "default"}),
                 "verbose": ("BOOLEAN", {"default": True}),
@@ -176,6 +176,15 @@ class DGLSModelLoader:
     TITLE = "DGLS Model Loader"
 
     def load_dgls_model(self, model_name, model_type, cast_dtype, verbose, custom_ckpt_path="", override_model_type="auto"):
+
+        import comfy.model_management as model_management
+        model_management.unload_all_models()
+        model_management.soft_empty_cache(True)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.synchronize()
+
 
         if custom_ckpt_path.strip():
             model_path = custom_ckpt_path.strip()
@@ -244,9 +253,12 @@ class DGLSModelLoader:
                 sd = torch.load(model_path, map_location='cpu')
 
             model_patcher = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options)
+
+        elif model_type == "unet":
+            # import comfy.model_management
+            unet_path = model_path
+            model_patcher = comfy.sd.load_unet(unet_path)
         else:
-            # unet_path = model_path
-            # model_patcher = comfy.sd.load_unet(unet_path)
             model_patcher = comfy.sd.load_diffusion_model(model_path, model_options=model_options)
 
         model_patcher = add_to_layers_method(model_patcher)
