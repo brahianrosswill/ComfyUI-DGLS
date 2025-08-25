@@ -162,9 +162,13 @@ class DGLSModelLoader:
                 "model_type": (["default", "hunyuan", "unet"], {"default": "default"}),
                 "cast_dtype": (["default", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
                                  {"default": "default"}),
-                "verbose": ("BOOLEAN", {"default": True}),
+                "clear_model_cache": ("BOOLEAN", {"default": False,
+                                                  "tooltip": "Force reload model from disk, ignoring ComfyUI's model cache"}),
+                "verbose": ("BOOLEAN", {"default": False}),
             },
             "optional": {
+                "nuke_all_caches": ("BOOLEAN", {"default": False,
+                                                "tooltip": "Clear all ComfyUI caches"}),
                 "custom_ckpt_path": ("STRING", {"default": ""}),
             }
         }
@@ -175,16 +179,16 @@ class DGLSModelLoader:
     CATEGORY = "loaders"
     TITLE = "DGLS Model Loader"
 
-    def load_dgls_model(self, model_name, model_type, cast_dtype, verbose, custom_ckpt_path="", override_model_type="auto"):
+    def load_dgls_model(self, model_name, model_type, cast_dtype,  verbose, clear_model_cache=False, nuke_all_caches=False, custom_ckpt_path="", override_model_type="auto"):
 
-        import comfy.model_management as model_management
-        model_management.unload_all_models()
-        model_management.soft_empty_cache(True)
 
-        torch.cuda.empty_cache()
-        gc.collect()
-        torch.cuda.synchronize()
+        self.verbose = verbose
 
+        # Cache clearing logic
+        if nuke_all_caches:
+            self.nuke_all_caches()
+        elif clear_model_cache:
+            self.clear_model_cache_only()
 
         if custom_ckpt_path.strip():
             model_path = custom_ckpt_path.strip()
@@ -237,13 +241,6 @@ class DGLSModelLoader:
 
             print(f"ComfyUI auto-detected: {detected_type}")
 
-        # model_patcher = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options)
-
-        # import comfy.model_management
-        # unet_path = model_path
-        # # model_patcher = comfy.sd.load_unet(unet_path)
-        # model_patcher = comfy.sd.load_diffusion_model(model_path, model_options=model_options)
-
         if model_type == "hunyuan":
             # Use state dict method for HunyuanVideo (avoids disconnection)
             if model_path.endswith('.safetensors'):
@@ -267,19 +264,48 @@ class DGLSModelLoader:
         layers = model_patcher.to_layers()
 
         if verbose:
-            print(f"Model loaded successfully")
+            print(f" Model loaded successfully")
             print(f"Total layers extracted: {len(layers)}")
-
-            if len(layers) > 0:
-                print(f"\n=== LAYER INSPECTION ===")
-                for i, layer in enumerate(layers):
-                    layer_type = type(layer).__name__
-                    param_dtypes = set()
-                    for name, param in layer.named_parameters():
-                        param_dtypes.add(param.dtype)
-                    dtype_str = f"dtypes: {list(param_dtypes)}" if param_dtypes else "no params"
-                    print(f"  {i:2d}: {layer_type:<20} | {dtype_str}")
-                print("========================\n")
 
         return (model_patcher, layers)
 
+    def clear_model_cache_only(self):
+        """Safely clear only model-related caches, preserve node execution cache"""
+        import comfy.model_management as model_management
+
+        if hasattr(self, 'verbose') and self.verbose:
+            print("🔄 Clearing model cache only (safe mode)...")
+
+        # Only clear models, not execution cache
+        model_management.unload_all_models()
+        model_management.soft_empty_cache(True)
+
+        # GPU cleanup
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.synchronize()
+
+        if hasattr(self, 'verbose') and self.verbose:
+            print("✓ Model cache cleared safely")
+
+    def nuke_all_caches(self):
+        """Clear ALL caches - may break downstream nodes"""
+        if hasattr(self, 'verbose') and self.verbose:
+            print("Clearing ALL ComfyUI caches...")
+
+        # Clear models first
+        self.clear_model_cache_only()
+
+        # Clear execution cache (dangerous part)
+        try:
+            import execution
+            # This is the risky part - affects ALL nodes
+            if hasattr(execution, 'PromptServer'):
+                server = execution.PromptServer.instance
+                if hasattr(server, 'cache'):
+                    server.cache.outputs.clear()
+                    server.cache.ui.clear()
+                    server.cache.objects.clear()
+                    print("  Execution cache cleared - other nodes may reload")
+        except Exception as e:
+            print(f"  Could not clear execution cache: {e}")
