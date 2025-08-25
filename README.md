@@ -2,7 +2,7 @@
 
 Smart dynamic layer swapping between GPU and CPU for optimal inference performance with comprehensive mixed precision handling and copy-compute overlap optimization. Enables running much larger models on limited VRAM setups.
 
-NOTE: I am am actively bug testing this atm. The code is working, however I havent promoted this or written about it due to some tests I want to carry out.
+NOTE: I am am actively bug testing this atm. The code is working, however I havent promoted this or written about it due to some tests I want to carry out. README is for an old version adn will be updated shortly
 
 Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' offical node should be fine with this swapped for it.
 
