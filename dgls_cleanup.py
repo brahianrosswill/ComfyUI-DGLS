@@ -2,8 +2,6 @@ import torch
 import gc
 import threading
 
-
-# Define any_type like they do
 class AnyType(str):
     def __ne__(self, __value: object) -> bool:
         return False
@@ -41,26 +39,18 @@ class DGLSCleanup:
 
         print("\n=== POST-CLEANUP DIAGNOSIS ===")
 
-        # Check CUDA memory
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated(0) / 1e9
             reserved = torch.cuda.memory_reserved(0) / 1e9
             print(f"CUDA memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
-            # If significant memory still allocated, something didn't clean up
-            if allocated > 0.5:  # More than 500MB
+            if allocated > 0.5:
                 print(f"WARNING: {allocated:.2f}GB still allocated after cleanup!")
 
         # Check ComfyUI's loaded models
         import comfy.model_management as model_management
         loaded = model_management.current_loaded_models
         print(f"ComfyUI loaded models: {len(loaded)}")
-
-        # Check threading state
-        # active_threads = threading.active_count()
-        # print(f"Active threads: {active_threads}")
-        # if active_threads > 2:  # Main + maybe one other
-        #     print(f"WARNING: {active_threads} threads still active!")
 
         print("==============================\n")
 
