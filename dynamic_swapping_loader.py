@@ -578,7 +578,7 @@ def calculate_auto_gpu_layers(layers, args):
             overhead += max_layer_size * 1.25 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.6 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.5 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -1594,3 +1594,4 @@ class CastingHandler:
                     casted_layers += 1
 
         print(f"✓ Pre-casted {casted_layers} layers using existing cast_to_dtype function")
+
