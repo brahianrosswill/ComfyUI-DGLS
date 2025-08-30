@@ -399,7 +399,8 @@ def print_memory_optimization_analysis(model, layers, args):
             print(f"  Minus inference overhead: -{inference_memory / 1024 ** 3:.2f} GB = {after_inference / 1024 ** 3:.2f} GB")
             print(f"  Minus swapping overhead: -{swapping_overhead / 1024 ** 3:.2f} GB = {available_for_layers / 1024 ** 3:.2f} GB")
             # layers_min = calculate_auto_gpu_layers(layers, args)
-            print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.1):.1f} Layers with prefetch=0")
+            if max_swappable_size > 0:
+                print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.1):.1f} Layers with prefetch=0")
             # print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {len(layers_min)} Layers for current settings")
 
 
