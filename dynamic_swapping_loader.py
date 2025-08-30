@@ -55,6 +55,7 @@ Author: obisin
 class Args:
     def __init__(self):
         self.dynamic_swapping = True
+        self.auto = False
         self.initial_gpu_layers = 1  # Number of initial layers to keep permanently on GPU
         self.final_gpu_layers = 1    # Number of final layers to keep permanently on GPU
         self.gpu_layers = None       # Comma-separated list of layer indices to keep permanently on GPU
@@ -125,8 +126,95 @@ casting_handler = None
 profiler_active = False
 
 # =============================================================================
-# CORE FUNCTIONS by obisin
+# ANALYSIS FUNCTIONS by obisin
 # =============================================================================
+
+def analyze_layer_performance():
+    """Analyze which layers should be permanent GPU residents based on performance"""
+    if not (hasattr(add_smart_swapping_to_layer, 'layer_transfer_times') or
+            hasattr(add_smart_swapping_to_layer, 'layer_compute_times')):
+        print("No performance data available yet")
+        return
+
+    print(f"\n=== LAYER PERFORMANCE ANALYSIS (Step {add_smart_swapping_to_layer.current_step}) ===")
+
+    # Calculate current totals
+    current_total_transfer = sum(sum(times) for times in add_smart_swapping_to_layer.layer_transfer_times.values())
+    current_total_compute = sum(sum(times) for times in add_smart_swapping_to_layer.layer_compute_times.values())
+
+    # Get count for averaging
+    total_values = sum(len(times) for times in add_smart_swapping_to_layer.layer_transfer_times.values())
+    total_values += sum(len(times) for times in add_smart_swapping_to_layer.layer_compute_times.values())
+
+    # OVERVIEW: Show averages
+    avg_total = (current_total_transfer + current_total_compute) / total_values if total_values > 0 else 0
+    avg_transfer = current_total_transfer / total_values if total_values > 0 else 0
+    avg_compute = current_total_compute / total_values if total_values > 0 else 0
+
+    gpu_mem_gb = torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0
+
+    current_time = time.time()
+    total_elapsed = current_time - add_smart_swapping_to_layer.total_start_time
+    steps_completed = add_smart_swapping_to_layer.current_step
+    seconds_per_iteration = total_elapsed / steps_completed if steps_completed > 0 else 0
+
+
+    print(f"OVERVIEW: CPU {avg_total:.1f}ms | Transfer {avg_transfer:.1f}ms | Compute {avg_compute:.1f}ms | GPU: {gpu_mem_gb:.2f}GB")
+    print(f"TIMING: {seconds_per_iteration:.2f}s/it ({steps_completed} steps in {total_elapsed:.1f}s)")
+    print(f"STATS: GPU Swaps {swap_stats['to_gpu']} | CPU Swaps {swap_stats['to_cpu']} | Prefetch Hits {getattr(add_smart_swapping_to_layer, 'prefetch_hits', 0)} | Prefetch Calls {getattr(add_smart_swapping_to_layer, 'prefetch_misses', 0)}")
+
+    combined_data = {}
+
+    if hasattr(add_smart_swapping_to_layer, 'layer_transfer_times'):
+        for layer_idx, transfer_times in add_smart_swapping_to_layer.layer_transfer_times.items():
+            if transfer_times:
+                avg_transfer = sum(transfer_times) / len(transfer_times)
+                combined_data[layer_idx] = {'event_transfer_time': avg_transfer}
+
+    if hasattr(add_smart_swapping_to_layer, 'layer_compute_times'):
+        for layer_idx, compute_times in add_smart_swapping_to_layer.layer_compute_times.items():
+            if compute_times:
+                avg_compute = sum(compute_times) / len(compute_times)
+                if layer_idx in combined_data:
+                    combined_data[layer_idx]['event_compute_time'] = avg_compute
+                else:
+                    combined_data[layer_idx] = {'event_compute_time': avg_compute}
+
+    if combined_data:
+        # Calculate threshold from accumulated averages
+        all_cpu_times = [data.get('event_transfer_time', 0) + data.get('event_compute_time', 0) for data in
+                         combined_data.values()]
+        avg_cpu = sum(all_cpu_times) / len(all_cpu_times)
+        std_cpu = (sum((x - avg_cpu) ** 2 for x in all_cpu_times) / len(all_cpu_times)) ** 0.5
+        cpu_threshold = avg_cpu + std_cpu
+
+        print(f"Threshold (avg + 1 std): {cpu_threshold:.1f}ms")
+        print()
+
+        # Show problematic layers
+        problematic_layers = []
+        for layer_idx in sorted(combined_data.keys()):
+            data = combined_data[layer_idx]
+
+            event_transfer = data.get('event_transfer_time', 0)
+            event_compute = data.get('event_compute_time', 0)
+            layer_total = event_transfer + event_compute
+
+            if layer_total > cpu_threshold:
+                bottleneck = "TRANSFER" if event_transfer > event_compute else "COMPUTE"
+                status = "RESIDENT" if layer_idx in gpu_resident_layers else "SWAPPABLE"
+
+                print(f"Layer {layer_idx:2d}: CPU {layer_total:5.1f}ms | Transfer {event_transfer:4.1f}ms | Compute {event_compute:5.1f}ms | {bottleneck:8s} | {status}")
+
+                problematic_layers.append(str(layer_idx))
+
+        if problematic_layers:
+            current_residents = sorted(gpu_resident_layers)
+            recommended = current_residents + [int(x) for x in problematic_layers]
+            print(f"\nRECOMMENDED LAYERS FOR GPU: \"{','.join(map(str, sorted(set(recommended))))}\"")
+            print("No. of Layers: ", len(recommended))
+
+    print("=" * 80)
 
 def debug_layer_locations(layers, device_cache):
     """Debug exact layer locations and memory usage"""
@@ -218,7 +306,7 @@ def print_memory_optimization_analysis(model, layers, args):
             print(f"  Name: {gpu_props.name}")
             print(f"  Total VRAM: {total_vram / 1024 ** 3:.2f} GB")
             print(f"  Free VRAM: {free_vram / 1024 ** 3:.2f} GB")
-            print(f"  Used VRAM: {used_vram / 1024 ** 3:.2f} GB ({used_vram / total_vram * 100:.1f}%) (After Layer loading on GPU)")
+            print(f"  Used VRAM: {used_vram / 1024 ** 3:.2f} GB ({used_vram / total_vram * 100:.1f}%)")
         else:
             print("\nWARNING: No CUDA device available!")
             total_vram = 0
@@ -273,7 +361,7 @@ def print_memory_optimization_analysis(model, layers, args):
             device = comfy.model_management.get_torch_device()
             total_free = comfy.model_management.get_free_memory(device)
 
-            reserved_memory = comfy.model_management.extra_reserved_memory()  # OS/driver overhead
+            # reserved_memory = comfy.model_management.extra_reserved_memory()  # OS/driver overhead
             inference_memory = comfy.model_management.minimum_inference_memory()  # Base inference needs
 
             # Calculate layer sizes
@@ -307,12 +395,12 @@ def print_memory_optimization_analysis(model, layers, args):
 
             print(f"MEMORY CALCULATION:")
             print(f"  Total free memory: {total_free / 1024 ** 3:.2f} GB")
-            print(f"  Reserved (OS/driver): {reserved_memory / 1024 ** 3:.2f} GB")
+            # print(f"  Reserved (OS/driver): {reserved_memory / 1024 ** 3:.2f} GB")
             print(f"  Minus inference overhead: -{inference_memory / 1024 ** 3:.2f} GB = {after_inference / 1024 ** 3:.2f} GB")
             print(f"  Minus swapping overhead: -{swapping_overhead / 1024 ** 3:.2f} GB = {available_for_layers / 1024 ** 3:.2f} GB")
-            print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.55):.1f} Layers with prefetch=0")
-
-
+            # layers_min = calculate_auto_gpu_layers(layers, args)
+            print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.1):.1f} Layers with prefetch=0")
+            # print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {len(layers_min)} Layers for current settings")
 
 
             # Current allocation
@@ -357,6 +445,12 @@ def print_memory_optimization_analysis(model, layers, args):
         'gpu_layers': list(gpu_layers) if available_for_layers else [],
         'swapping_overhead_gb': swapping_overhead / 1024 ** 3 if available_for_layers else 0
     }
+
+
+# =============================================================================
+# DYNAMIC LAYER SWAPPING INFERENCE for Comfy-UI - by obisin
+# =============================================================================
+
 
 def fix_inference_tensor_parameters(layer):
     """Fix inference tensor parameters in a layer if needed"""
@@ -418,6 +512,108 @@ class LayerDeviceCache:
         """Update cache when we move a layer"""
         self.cache[layer_idx] = new_device
 
+
+def calculate_auto_gpu_layers(layers, args):
+    """Auto-select GPU layers allocation logic with safety mechanisms"""
+
+    device = comfy.model_management.get_torch_device()
+
+    # Step 1: Cleanup existing models
+    comfy.model_management.cleanup_models_gc()
+
+    # Step 2: Calculate total memory required with safety multiplier
+    total_model_size = sum(comfy.model_management.module_size(layer) for layer in layers)
+    memory_required_with_safety = total_model_size * 1.1
+    minimum_memory_required = comfy.model_management.minimum_inference_memory()
+    extra_mem = max(minimum_memory_required,
+                    memory_required_with_safety + comfy.model_management.extra_reserved_memory())
+
+    # Step 3: Free memory if needed (ComfyUI's approach)
+    initial_free_memory = comfy.model_management.get_free_memory(device)
+    if initial_free_memory < memory_required_with_safety + minimum_memory_required:
+        comfy.model_management.free_memory(memory_required_with_safety + extra_mem, device)
+        print("Freed other models to make space")
+
+    # Step 4: Secondary safety check
+    current_free_mem = comfy.model_management.get_free_memory(device)
+    if current_free_mem < minimum_memory_required:
+        comfy.model_management.free_memory(minimum_memory_required, device)
+        current_free_mem = comfy.model_management.get_free_memory(device)
+
+    # Step 5: Platform-specific memory ratio
+    if comfy.model_management.is_nvidia():
+        min_ratio = 0.0
+    else:
+        min_ratio = 0.4
+
+    # Step 6: budget calculation
+    layer_memory_budget = max(
+        128 * 1024 * 1024,
+        (current_free_mem - minimum_memory_required),
+        min(
+            current_free_mem * min_ratio,
+            current_free_mem - minimum_memory_required
+        )
+    )
+
+    # Get currently loaded memory and subtract it
+    loaded_memory = sum(model.loaded_size() for model in comfy.model_management.loaded_models())
+    layer_memory_budget = max(0.1, layer_memory_budget - loaded_memory)
+
+    # Step 7: Calculate layer sizes and sort (largest first)
+    layer_allocation_data = []
+    for i, layer in enumerate(layers):
+        layer_size = comfy.model_management.module_size(layer)
+        layer_allocation_data.append((layer_size, i))
+
+    layer_allocation_data.sort(reverse=True, key=lambda x: x[0])
+
+    # Step 8: Apply overhead from user settings
+    if layer_allocation_data:
+        max_layer_size = layer_allocation_data[0][0]
+        overhead = max_layer_size * 1.1 * (args.prefetch + 1)
+
+        if args.cpu_threading:
+            overhead += max_layer_size * 1.25 * (args.prefetch + 1)
+
+        if args.cuda_streams:
+            overhead += max_layer_size * 0.6 * (args.prefetch + 1)
+
+        layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
+
+    # Step 9: Greedy allocation
+    allocated_memory = 0
+    selected_gpu_layers = set()
+
+    for layer_size, layer_idx in layer_allocation_data:
+        if allocated_memory + layer_size <= layer_memory_budget:
+            allocated_memory += layer_size
+            selected_gpu_layers.add(layer_idx)
+        else:
+            break
+
+    # Step 10: Final validation
+    if allocated_memory > current_free_mem * 0.85:  # Additional safety check
+        print("WARNING: High memory allocation detected, reducing selection")
+        # Remove smallest selected layers until under 85% of free memory
+        selected_list = [(layer_allocation_data[i][0], layer_allocation_data[i][1]) for i in
+                         range(len(layer_allocation_data)) if layer_allocation_data[i][1] in selected_gpu_layers]
+        selected_list.sort()  # Smallest first for removal
+
+        while allocated_memory > current_free_mem * 0.8 and selected_list:
+            removed_size, removed_idx = selected_list.pop(0)
+            selected_gpu_layers.remove(removed_idx)
+            allocated_memory -= removed_size
+
+    if args.verbose:
+        print(f"Free VRAM: {current_free_mem / (1024 ** 2):.0f}MB")
+        print(f"Final budget: {layer_memory_budget / (1024 ** 2):.0f}MB")
+        print(f"Auto-selected GPU layers: {sorted(selected_gpu_layers)}")
+        print(f"Final allocated: {allocated_memory / (1024 ** 2):.0f}MB")
+
+    return selected_gpu_layers
+
+
 def calculate_needed_layers(layer_idx, prefetch):
     needed = set()
     needed.add(layer_idx)
@@ -457,97 +653,6 @@ def calculate_needed_layers(layer_idx, prefetch):
     #     print(f"Layer {layer_idx}: needed {len(needed)} layers {sorted(needed)} (prefetch={prefetch})")
     return needed
 
-# =============================================================================
-# DYNAMIC LAYER SWAPPING INFERENCE for Comfy-UI - by obisin
-# =============================================================================
-
-def analyze_layer_performance():
-    """Analyze which layers should be permanent GPU residents based on performance"""
-    if not (hasattr(add_smart_swapping_to_layer, 'layer_transfer_times') or
-            hasattr(add_smart_swapping_to_layer, 'layer_compute_times')):
-        print("No performance data available yet")
-        return
-
-    print(f"\n=== LAYER PERFORMANCE ANALYSIS (Step {add_smart_swapping_to_layer.current_step}) ===")
-
-    # Calculate current totals
-    current_total_transfer = sum(sum(times) for times in add_smart_swapping_to_layer.layer_transfer_times.values())
-    current_total_compute = sum(sum(times) for times in add_smart_swapping_to_layer.layer_compute_times.values())
-
-    # Get count for averaging
-    total_values = sum(len(times) for times in add_smart_swapping_to_layer.layer_transfer_times.values())
-    total_values += sum(len(times) for times in add_smart_swapping_to_layer.layer_compute_times.values())
-
-    # OVERVIEW: Show averages
-    avg_total = (current_total_transfer + current_total_compute) / total_values if total_values > 0 else 0
-    avg_transfer = current_total_transfer / total_values if total_values > 0 else 0
-    avg_compute = current_total_compute / total_values if total_values > 0 else 0
-
-    gpu_mem_gb = torch.cuda.memory_allocated() / 1024 ** 3 if torch.cuda.is_available() else 0
-
-    current_time = time.time()
-    total_elapsed = current_time - add_smart_swapping_to_layer.total_start_time
-    steps_completed = add_smart_swapping_to_layer.current_step
-    seconds_per_iteration = total_elapsed / steps_completed if steps_completed > 0 else 0
-
-
-    print(f"OVERVIEW: CPU {avg_total:.1f}ms | Transfer {avg_transfer:.1f}ms | Compute {avg_compute:.1f}ms | GPU: {gpu_mem_gb:.2f}GB")
-    print(f"TIMING: {seconds_per_iteration:.2f}s/it ({steps_completed} steps in {total_elapsed:.1f}s)")
-    print(f"STATS: GPU Swaps {swap_stats['to_gpu']} | CPU Swaps {swap_stats['to_cpu']} | Prefetch Hits {getattr(add_smart_swapping_to_layer, 'prefetch_hits', 0)} | Prefetch Calls {getattr(add_smart_swapping_to_layer, 'prefetch_misses', 0)}")
-
-    combined_data = {}
-
-    if hasattr(add_smart_swapping_to_layer, 'layer_transfer_times'):
-        for layer_idx, transfer_times in add_smart_swapping_to_layer.layer_transfer_times.items():
-            if transfer_times:
-                avg_transfer = sum(transfer_times) / len(transfer_times)
-                combined_data[layer_idx] = {'event_transfer_time': avg_transfer}
-
-    if hasattr(add_smart_swapping_to_layer, 'layer_compute_times'):
-        for layer_idx, compute_times in add_smart_swapping_to_layer.layer_compute_times.items():
-            if compute_times:
-                avg_compute = sum(compute_times) / len(compute_times)
-                if layer_idx in combined_data:
-                    combined_data[layer_idx]['event_compute_time'] = avg_compute
-                else:
-                    combined_data[layer_idx] = {'event_compute_time': avg_compute}
-
-    if combined_data:
-        # Calculate threshold from accumulated averages
-        all_cpu_times = [data.get('event_transfer_time', 0) + data.get('event_compute_time', 0) for data in
-                         combined_data.values()]
-        avg_cpu = sum(all_cpu_times) / len(all_cpu_times)
-        std_cpu = (sum((x - avg_cpu) ** 2 for x in all_cpu_times) / len(all_cpu_times)) ** 0.5
-        cpu_threshold = avg_cpu + std_cpu
-
-        print(f"Threshold (avg + 1 std): {cpu_threshold:.1f}ms")
-        print()
-
-        # Show problematic layers
-        problematic_layers = []
-        for layer_idx in sorted(combined_data.keys()):
-            data = combined_data[layer_idx]
-
-            event_transfer = data.get('event_transfer_time', 0)
-            event_compute = data.get('event_compute_time', 0)
-            layer_total = event_transfer + event_compute
-
-            if layer_total > cpu_threshold:
-                bottleneck = "TRANSFER" if event_transfer > event_compute else "COMPUTE"
-                status = "RESIDENT" if layer_idx in gpu_resident_layers else "SWAPPABLE"
-
-                print(f"Layer {layer_idx:2d}: CPU {layer_total:5.1f}ms | Transfer {event_transfer:4.1f}ms | Compute {event_compute:5.1f}ms | {bottleneck:8s} | {status}")
-
-                problematic_layers.append(str(layer_idx))
-
-        if problematic_layers:
-            current_residents = sorted(gpu_resident_layers)
-            recommended = current_residents + [int(x) for x in problematic_layers]
-            print(f"\nRECOMMENDED LAYERS FOR GPU: \"{','.join(map(str, sorted(set(recommended))))}\"")
-            print("No. of Layers: ", len(recommended))
-
-    print("=" * 80)
-
 def cleanup_excess_layers(keep_layers):
     """Remove layers from GPU that are not in keep_layers set"""
     def _cleanup_operation():
@@ -564,7 +669,7 @@ def cleanup_excess_layers(keep_layers):
             if args.cpu_threading and hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
                 def batch_cpu_transfer():
                     for idx in layers_to_remove:
-                        # CUDA event timing
+                        # Add CUDA event timing
                         if args.verbose:
                             start_event = torch.cuda.Event(enable_timing=True)
                             end_event = torch.cuda.Event(enable_timing=True)
@@ -584,7 +689,7 @@ def cleanup_excess_layers(keep_layers):
                 add_smart_swapping_to_layer.cpu_thread_pool.submit(batch_cpu_transfer)
             else:
                 for idx in layers_to_remove:
-                    # CUDA event timing
+                    # Add CUDA event timing
                     if args.verbose:
                         start_event = torch.cuda.Event(enable_timing=True)
                         end_event = torch.cuda.Event(enable_timing=True)
@@ -612,6 +717,7 @@ def cleanup_excess_layers(keep_layers):
 
         return cleaned_count
 
+    # Profile every 5th step, not every cleanup
     if not hasattr(cleanup_excess_layers, 'step_counter'):
         cleanup_excess_layers.step_counter = 0
 
@@ -664,7 +770,7 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
                             add_smart_swapping_to_layer.layer_transfer_times[idx].append(transfer_time)
             else:
                 for idx in layers_to_fetch:
-                    # CUDA event timing
+                    # Add CUDA event timing
                     if args.verbose:
                         start_event = torch.cuda.Event(enable_timing=True)
                         end_event = torch.cuda.Event(enable_timing=True)
@@ -768,6 +874,10 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
             # Detect Flux calling patterns
             layer_type = type(layer).__name__
             is_flux_call = 'DoubleStream' in layer_type or 'SingleStream' in layer_type
+            is_keyword_only_call = any(pattern in layer_type for pattern in ['QwenImage',
+                                                                             # 'OmniGen',
+                                                                             'HiDream'])
+
 
             if is_flux_call:
                 # Flux patterns - preserve exact argument structure
@@ -781,6 +891,10 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                     x = kwargs.get('img')
                     new_args = ()
                     new_kwargs = kwargs
+            elif is_keyword_only_call:
+                x = None
+                new_args = ()
+                new_kwargs = kwargs
             else:
                 # WAN/SDXL pattern
                 x = fwd_args[0] if fwd_args else None
@@ -852,7 +966,7 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
 
                 move_to_device.current_layer = layer_idx
 
-                # Move tensors to device
+                # Move tensors to device (respect the calling pattern you already set up)
                 if is_flux_call:
                     if fwd_args:
                         # SingleStreamBlock - move fwd_args and kwargs
@@ -862,6 +976,11 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         # DoubleStreamBlock - move only kwargs
                         new_args = ()
                         new_kwargs = {k: move_to_device(v, device) for k, v in kwargs.items()}
+                elif is_keyword_only_call:
+                    # move only kwargs, no positional args
+                    x = None
+                    new_args = ()
+                    new_kwargs = {k: move_to_device(v, device) for k, v in kwargs.items()}
                 else:
                     x = move_to_device(x, device)
                     new_kwargs = {k: move_to_device(v, device) for k, v in kwargs.items()}
@@ -876,7 +995,7 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         event = add_smart_swapping_to_layer.transfer_events[layer_idx]
                         add_smart_swapping_to_layer.compute_stream.wait_event(event)
 
-                # 4. COMPUTATION 
+                # 4. COMPUTATION with profiling
                 def _compute_operation():
                     if args.verbose:
                         compute_start = time.perf_counter()
@@ -889,8 +1008,13 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                                     result = original_forward(*new_args, **new_kwargs)
                                 else:
                                     result = original_forward(**new_kwargs)
+
+                            elif is_keyword_only_call:
+                                result = original_forward(**new_kwargs)
                             else:
                                 result = original_forward(x, *new_args, **new_kwargs)
+
+
                     else:
                         fix_inference_tensor_parameters(layer)
                         if is_flux_call:
@@ -898,6 +1022,8 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                                 result = original_forward(*new_args, **new_kwargs)
                             else:
                                 result = original_forward(**new_kwargs)
+                        elif is_keyword_only_call:
+                            result = original_forward(**new_kwargs)
                         else:
                             result = original_forward(x, *new_args, **new_kwargs)
 
@@ -974,6 +1100,7 @@ class DynamicSwappingLoader:
                 "layers": ("LAYERS",),
                 "initial_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["initial_gpu_layers"]}),
                 "final_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["final_gpu_layers"]}),
+                "auto": ("BOOLEAN", {"default": False, "tooltip": "Automatically determine layer placement based on available VRAM. Overrides any other layer placement."}),
                 "prefetch": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["prefetch"]}),
                 "cpu_threading": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cpu_threading"]}),
                 "cuda_streams": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cuda_streams"]}),
@@ -993,7 +1120,7 @@ class DynamicSwappingLoader:
     TITLE = "Dynamic Swapping Loader"
 
 
-    def load_model_with_swapping(self, model, layers, initial_gpu_layers, final_gpu_layers,
+    def load_model_with_swapping(self, model, layers, initial_gpu_layers, final_gpu_layers, auto,
                                  prefetch, verbose, gpu_layer_indices="",
                                  cast_target="", cuda_streams=False, cpu_threading=False):
 
@@ -1041,6 +1168,7 @@ class DynamicSwappingLoader:
         args.cuda_streams = cuda_streams
         args.cpu_threading = cpu_threading
         args.verbose = verbose
+        args.auto = auto
 
         args.gpu_layers = gpu_layer_indices.strip() if gpu_layer_indices.strip() else None
         args.cast_target = cast_target.strip() if cast_target.strip() else None
@@ -1060,6 +1188,7 @@ class DynamicSwappingLoader:
         if not hasattr(add_smart_swapping_to_layer, 'layer_compute_times'):
             add_smart_swapping_to_layer.layer_compute_times = []
 
+        # Initialize coordination state (once) - this should match _patch_model_patcher
         if not hasattr(add_smart_swapping_to_layer, 'current_sampling_step'):
             add_smart_swapping_to_layer.current_sampling_step = 0
             add_smart_swapping_to_layer.last_processed_step = -1
@@ -1171,7 +1300,9 @@ class DynamicSwappingLoader:
             #     print("Applying ENHANCED smart GPU allocation + dynamic swapping...")
                 print(f"Setting up enhanced swapping for {len(layers)} layers...")
 
-            if args.gpu_layers:
+            if args.auto:
+                specified_gpu_layers = calculate_auto_gpu_layers(layers, args)
+            elif args.gpu_layers and not args.auto:
                 try:
                     specified_gpu_layers = set(map(int, args.gpu_layers.split(',')))
                     if args.verbose:
@@ -1190,6 +1321,8 @@ class DynamicSwappingLoader:
                 specified_gpu_layers = None
                 if args.verbose:
                     print(f"Using initial/final layer allocation: {initial_gpu_layers}/{final_gpu_layers}")
+
+
 
 
             global current_model
@@ -1265,6 +1398,8 @@ class DynamicSwappingLoader:
             print(f"✓ {len(gpu_resident_layers)} layers permanently on GPU: {sorted(gpu_resident_layers)}")
             print(f"✓ {len(cpu_swappable_layers)} layers on CPU with smart swapping: {sorted(cpu_swappable_layers)}")
 
+
+
             # if args.verbose:
             #     if torch.cuda.is_available():
             #         final_memory = torch.cuda.memory_allocated(0)
@@ -1282,8 +1417,6 @@ class DynamicSwappingLoader:
             #             print(f"Module {name}: {module_mem / 1024 ** 2:.1f} MB")
             #             total_module_mem += module_mem
             # print(f"Total module memory: {total_module_mem / 1024 ** 3:.2f} GB")
-
-
 
             global device_cache
             device_cache = LayerDeviceCache(model, layers)
