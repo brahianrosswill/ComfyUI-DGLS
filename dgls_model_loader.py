@@ -159,16 +159,12 @@ class DGLSModelLoader:
         return {
             "required": {
                 "model_name": (model_list, {"default": model_list[0] if model_list else ""}),
-                "model_type": (["default", "hunyuan", "unet"], {"default": "default"}),
-                "cast_dtype": (["default", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
-                                 {"default": "default"}),
-                "clear_model_cache": ("BOOLEAN", {"default": False,
-                                                  "tooltip": "Force reload model from disk, ignoring ComfyUI's model cache"}),
+                "model_type": (["default", "hunyuan", "unet"], {"default": "default", "tooltip": "Unet is just for Debugging, its a legacy loader- Use default"}),
+                "cast_dtype": (["default", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],{"default": "default"}),
+                "clear_model_cache": ("BOOLEAN", {"default": False, "tooltip": "Force reload model from disk, ignoring ComfyUI's model cache"}),
                 "verbose": ("BOOLEAN", {"default": False}),
             },
-            "optional": {
-                "nuke_all_caches": ("BOOLEAN", {"default": False,
-                                                "tooltip": "Clear all ComfyUI caches"}),
+            "optional": {"nuke_all_caches": ("BOOLEAN", {"default": False, "tooltip": "CAUTION: Aggressive Clear all ComfyUI caches"}),
                 "custom_ckpt_path": ("STRING", {"default": ""}),
             }
         }
@@ -274,7 +270,7 @@ class DGLSModelLoader:
         import comfy.model_management as model_management
 
         if hasattr(self, 'verbose') and self.verbose:
-            print("🔄 Clearing model cache only (safe mode)...")
+            print("Clearing model cache only...")
 
         # Only clear models, not execution cache
         model_management.unload_all_models()
