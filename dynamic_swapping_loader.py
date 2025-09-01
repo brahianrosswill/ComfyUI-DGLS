@@ -230,23 +230,56 @@ def _has_version_counter(t: torch.Tensor) -> bool:
     except (RuntimeError, AttributeError):
         return False
 
+# def fix_inference_tensor_parameters(layer):
+#     """
+#     Ensure all tensors owned by this module have a normal version counter.
+#     """
+#     fixed = False
+#     with torch.inference_mode(False), torch.no_grad():
+#         # 1) Parameters: re-register as fresh Parameters if needed
+#         for name, p in list(layer.named_parameters(recurse=False)):
+#             if p is not None and not _has_version_counter(p):
+#                 new_p = p.detach().to(p.device, p.dtype)
+#                 setattr(layer, name, torch.nn.Parameter(new_p, requires_grad=False))
+#                 fixed = True
+#
+#         # 2) Buffers: re-register if needed
+#         for name, b in list(layer.named_buffers(recurse=False)):
+#             if b is not None and not _has_version_counter(b):
+#                 new_b = b.detach().to(b.device, b.dtype)
+#                 layer.register_buffer(name, new_b, persistent=True)
+#                 fixed = True
+#
+#         # 3) Plain tensor attributes used by WAN/Flux blocks
+#         tensor_attrs = ["modulation", "freqs", "pe", "vec", "norm", "scale",
+#                        "pos_embed", "time_embed", "label_embed"]
+#         for attr_name in tensor_attrs:
+#             if hasattr(layer, attr_name):
+#                 t = getattr(layer, attr_name)
+#                 if isinstance(t, torch.Tensor) and not _has_version_counter(t):
+#                     new_t = t.detach().to(t.device, t.dtype)
+#                     setattr(layer, attr_name, new_t)
+#                     fixed = True
+#
+#     return fixed
+#
 def fix_inference_tensor_parameters(layer):
     """
     Ensure all tensors owned by this module have a normal version counter.
     """
     fixed = False
     with torch.inference_mode(False), torch.no_grad():
-        # 1) Parameters: re-register as fresh Parameters if needed
+        # 1) Parameters: re-register using ComfyUI's safe casting
         for name, p in list(layer.named_parameters(recurse=False)):
             if p is not None and not _has_version_counter(p):
-                new_p = p.detach().clone().to(p.device, p.dtype)
+                new_p = comfy.model_management.cast_to_device(p, p.device, p.dtype, copy=False)
                 setattr(layer, name, torch.nn.Parameter(new_p, requires_grad=False))
                 fixed = True
 
-        # 2) Buffers: re-register if needed
+        # 2) Buffers: re-register using ComfyUI's safe casting
         for name, b in list(layer.named_buffers(recurse=False)):
             if b is not None and not _has_version_counter(b):
-                new_b = b.detach().clone().to(b.device, b.dtype)
+                new_b = comfy.model_management.cast_to_device(b, b.device, b.dtype, copy=False)
                 layer.register_buffer(name, new_b, persistent=True)
                 fixed = True
 
@@ -257,7 +290,7 @@ def fix_inference_tensor_parameters(layer):
             if hasattr(layer, attr_name):
                 t = getattr(layer, attr_name)
                 if isinstance(t, torch.Tensor) and not _has_version_counter(t):
-                    new_t = t.detach().clone().to(t.device, t.dtype)
+                    new_t = comfy.model_management.cast_to_device(t, t.device, t.dtype, copy=False)
                     setattr(layer, attr_name, new_t)
                     fixed = True
 
@@ -803,9 +836,14 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                 #     return tensor
 
 
+                # def move_to_device(tensor, target_device):
+                #     if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
+                #         return tensor.to(target_device, non_blocking=True)
+                #     return tensor
+
                 def move_to_device(tensor, target_device):
                     if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
-                        return tensor.to(target_device, non_blocking=True)
+                        return comfy.model_management.cast_to_device(tensor, target_device, tensor.dtype, copy=False)
                     return tensor
 
                 move_to_device.current_layer = layer_idx
