@@ -398,10 +398,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.2 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.2 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -594,23 +594,17 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
             return fetched_count
 
         # Use threading if enabled
-        # if args.cpu_threading and hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
-        #     future = add_smart_swapping_to_layer.cpu_thread_pool.submit(unified_gpu_transfer)
-        #
-        #     # Wait only if we need the current layer immediately
-        #     if current_layer_idx is not None and current_layer_idx in layers_to_fetch:
-        #         fetched_count = future.result()  # Block until current layer ready
-        #     else:
-        #         fetched_count = len(layers_to_fetch)  # Estimate
-        # else:
-        #     fetched_count = unified_gpu_transfer()
-
         if args.cpu_threading and hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
-            add_smart_swapping_to_layer.transfer_futures[f'fetch_{time.time()}'] = \
-                add_smart_swapping_to_layer.cpu_thread_pool.submit(unified_gpu_transfer)
+            future = add_smart_swapping_to_layer.cpu_thread_pool.submit(unified_gpu_transfer)
 
-            # Don't block here; rely on event wait/poll for current layer only
-            fetched_count = len(layers_to_fetch)
+            # Wait only if we need the current layer immediately
+            if current_layer_idx is not None and current_layer_idx in layers_to_fetch:
+                fetched_count = future.result()  # Block until current layer ready
+            else:
+                fetched_count = len(layers_to_fetch)  # Estimate
+        else:
+            fetched_count = unified_gpu_transfer()
+
 
         # Wait only for current layer if specified
         if current_layer_idx is not None and current_layer_idx in layers_to_fetch:
