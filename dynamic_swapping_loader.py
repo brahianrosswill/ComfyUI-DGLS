@@ -223,31 +223,6 @@ def debug_layer_locations(layers, device_cache):
 # DYNAMIC LAYER SWAPPING INFERENCE for Comfy-UI - by obisin
 # =============================================================================
 
-# def fix_inference_tensor_parameters(layer):
-#     """Fix inference tensor parameters in a layer if needed"""
-#     # Quick check if ANY parameters need fixing
-#     needs_fixing = False
-#     with torch.no_grad():
-#         for name, param in layer.named_parameters():
-#             if param is not None:
-#                 try:
-#                     _ = param._version
-#                 except (RuntimeError, AttributeError):
-#                     needs_fixing = True
-#                     break
-#
-#     # Only fix if needed
-#     if needs_fixing:
-#         with torch.no_grad():
-#             for name, param in layer.named_parameters():
-#                 if param is not None:
-#                     try:
-#                         _ = param._version
-#                     except (RuntimeError, AttributeError):
-#                         param.data = param.data.detach().clone()
-#
-#     return needs_fixing
-
 def _has_version_counter(t: torch.Tensor) -> bool:
     try:
         _ = t._version
@@ -277,9 +252,8 @@ def fix_inference_tensor_parameters(layer):
                 layer.register_buffer(name, new_b, persistent=True)
                 fixed = True
 
-        # 3) Plain tensor attributes commonly used by WAN/Flux blocks
-        # Scan a small allowlist to avoid touching huge trees.
-        for attr_name in ("modulation", "freqs", "pe", "vec"):
+        # 3) Plain tensor attributes used by WAN/Flux blocks
+        for attr_name in ("modulation", "freqs", "pe", "vec", "norm", "scale"):
             if hasattr(layer, attr_name):
                 t = getattr(layer, attr_name)
                 if isinstance(t, torch.Tensor) and not _has_version_counter(t):
@@ -799,32 +773,31 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         print(f" CRITICAL: Layer {layer_idx} cannot fit on GPU, skipping computation!")
                         return x  # Pass input through unchanged
 
+
                 def move_to_device(tensor, target_device):
-                    # Intentional- rely on Comfy's weight casting; inputs stay put.
-                    return tensor
-                    if PROFILE:
-                        nvtx.range_push(f"Move_Tensor_To_{target_device.type}")
-                    try:
-                        # Only move device, don't touch dtype at all
-                        if hasattr(tensor, 'device') and tensor.device != target_device:
-                            tensor = tensor.to(target_device)
-
-                        # # Fix inference tensors (without dtype changes)
-                        # if isinstance(tensor, torch.Tensor):
-                        #     try:
-                        #         _ = tensor._version
-                        #         return tensor
-                        #     except (RuntimeError, AttributeError):
-                        #         return tensor.detach()#.clone()
-
+                    if not isinstance(tensor, torch.Tensor):
                         return tensor
-                    finally:
-                        if PROFILE:
-                            nvtx.range_pop()
+                    # Fix inference mode tensors BEFORE moving
+                    if hasattr(tensor, 'device'):
+                        # Check if tensor needs inference mode fix
+                        try:
+                            _ = tensor._version
+                            fixed_tensor = tensor
+                        except (RuntimeError, AttributeError):
+                            # Clone to get normal tensor
+                            with torch.inference_mode(False), torch.no_grad():
+                                fixed_tensor = tensor.detach()#.clone()
+
+                        # Move to target device
+                        if fixed_tensor.device != target_device:
+                            return fixed_tensor.to(target_device, non_blocking=True)
+                        else:
+                            return fixed_tensor
+
+                    return tensor
 
                 move_to_device.current_layer = layer_idx
 
-                # Move tensors to device (respect the calling pattern you already set up)
                 if is_flux_call:
                     if fwd_args:
                         # SingleStreamBlock - move fwd_args and kwargs
