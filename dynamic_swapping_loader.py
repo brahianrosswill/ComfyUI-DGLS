@@ -232,9 +232,7 @@ def _has_version_counter(t: torch.Tensor) -> bool:
 
 def fix_inference_tensor_parameters(layer):
     """
-    Ensure all tensors owned by this module (params, buffers, common plain-tensor attrs)
-    have a normal version counter (i.e., were not created under inference_mode()).
-    Run with inference_mode(False) + no_grad before wrapping forward.
+    Ensure all tensors owned by this module have a normal version counter.
     """
     fixed = False
     with torch.inference_mode(False), torch.no_grad():
@@ -253,7 +251,9 @@ def fix_inference_tensor_parameters(layer):
                 fixed = True
 
         # 3) Plain tensor attributes used by WAN/Flux blocks
-        for attr_name in ("modulation", "freqs", "pe", "vec", "norm", "scale"):
+        tensor_attrs = ["modulation", "freqs", "pe", "vec", "norm", "scale",
+                       "pos_embed", "time_embed", "label_embed"]
+        for attr_name in tensor_attrs:
             if hasattr(layer, attr_name):
                 t = getattr(layer, attr_name)
                 if isinstance(t, torch.Tensor) and not _has_version_counter(t):
@@ -774,26 +774,38 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         return x  # Pass input through unchanged
 
 
+                # def move_to_device(tensor, target_device):
+                #     if not isinstance(tensor, torch.Tensor):
+                #         return tensor
+                #     # Fix inference mode tensors BEFORE moving
+                #     if hasattr(tensor, 'device'):
+                #         # Check if tensor needs inference mode fix
+                #         try:
+                #             _ = tensor._version
+                #             fixed_tensor = tensor
+                #         except (RuntimeError, AttributeError):
+                #             # Clone to get normal tensor
+                #             with torch.inference_mode(False), torch.no_grad():
+                #                 fixed_tensor = tensor.detach()#.clone()
+                #
+                #         # Move to target device
+                #         if fixed_tensor.device != target_device:
+                #             return fixed_tensor.to(target_device, non_blocking=True)
+                #         else:
+                #             return fixed_tensor
+                #
+                #     return tensor
+
+                # def move_to_device(tensor, target_device):
+                #     if isinstance(tensor, torch.Tensor) and hasattr(tensor, 'device'):
+                #         if tensor.device != target_device:
+                #             return tensor.to(target_device, non_blocking=True)
+                #     return tensor
+
+
                 def move_to_device(tensor, target_device):
-                    if not isinstance(tensor, torch.Tensor):
-                        return tensor
-                    # Fix inference mode tensors BEFORE moving
-                    if hasattr(tensor, 'device'):
-                        # Check if tensor needs inference mode fix
-                        try:
-                            _ = tensor._version
-                            fixed_tensor = tensor
-                        except (RuntimeError, AttributeError):
-                            # Clone to get normal tensor
-                            with torch.inference_mode(False), torch.no_grad():
-                                fixed_tensor = tensor.detach()#.clone()
-
-                        # Move to target device
-                        if fixed_tensor.device != target_device:
-                            return fixed_tensor.to(target_device, non_blocking=True)
-                        else:
-                            return fixed_tensor
-
+                    if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
+                        return tensor.to(target_device, non_blocking=True)
                     return tensor
 
                 move_to_device.current_layer = layer_idx
@@ -830,7 +842,7 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
 
                 # 4. COMPUTATION with profiling
                 def _compute_operation():
-                    with torch.inference_mode(False), torch.no_grad():
+                    with torch.no_grad():
                         if args.verbose:
                             compute_start = time.perf_counter()
 
@@ -1024,7 +1036,6 @@ class DynamicSwappingLoader:
         if hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
             print("WARNING: Previous model not cleaned up - thread pool still exists")
 
-
         # debug_comfy_memory_state()
 
         # Reset all stats for new generation
@@ -1173,7 +1184,6 @@ class DynamicSwappingLoader:
 
                 print(f"  {i:2d}: {layer_type:<20} | {dtype_str}")
             print("===============================\n")
-
 
 
         # #FORCE first and last layer onto card regardless of settings for stability
@@ -1406,19 +1416,19 @@ class DynamicSwappingLoader:
                 gpu_resident_layers,
                 cpu_swappable_layers)
 
-        # for layer_idx in gpu_resident_layers:
-        #     layer = layers[layer_idx]
-        #     original_forward = layer.forward
-        #
-        #     def create_resident_forward(layer_idx, original_forward):
-        #         current_args = args
-        #         @wraps(original_forward)
-        #         def resident_forward( *args_tuple, **kwargs):
-        #             result = original_forward( *args_tuple, **kwargs)
-        #             return result
-        #         return resident_forward
-        #
-        #     layer.forward = create_resident_forward(layer_idx, original_forward)
+        if args.verbose:
+            print("Verifying tensor fixes...")
+            problematic_layers = []
+            for i, layer in enumerate(layers):
+                for name, param in layer.named_parameters():
+                    if not _has_version_counter(param):
+                        problematic_layers.append(i)
+                        break
+
+            if problematic_layers:
+                print(f"WARNING: Layers {problematic_layers} still have inference tensors")
+            else:
+                print("All layer tensors properly fixed at startup")
 
         if args.verbose:
             print("✓ Dynamic swapping successfully integrated with ComfyUI")
