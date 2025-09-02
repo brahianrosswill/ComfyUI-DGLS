@@ -6,6 +6,15 @@ import comfy.model_detection
 import gc
 import comfy.utils
 import comfy.model_management
+import comfy.sd
+import folder_paths
+import torch
+import comfy.model_management
+import comfy.utils
+import comfy.lora
+import comfy.float
+import collections
+from comfy.model_patcher import get_key_weight, string_to_seed
 """
 DGLS Model Loader for ComfyUI by obisin
 ============================
@@ -257,11 +266,12 @@ class DGLSModelLoader:
         else:
             model_patcher = comfy.sd.load_diffusion_model(model_path, model_options=model_options)
 
-        fixed = self.normalize_inference_params(model_patcher, verbose=verbose)
+        model_patcher = self.ensure_model_ready(model_patcher, verbose=verbose)
+        # fixed = self.normalize_inference_params(model_patcher, verbose=verbose)
+        # model_patcher = self.normalize_inference_model_patcher(model_patcher)
 
         model_patcher = add_to_layers_method(model_patcher, verbose=verbose)
         layers = model_patcher.to_layers()
-
         if verbose:
             print(f" Model loaded successfully")
             print(f"Total layers extracted: {len(layers)}")
@@ -271,6 +281,112 @@ class DGLSModelLoader:
     # =============================================================================
     # TENSOR FIXES by obisin
     # =============================================================================
+
+    def ensure_model_ready(self, model_patcher, verbose=False):
+        """Ensure model is ready for inference without duplicating ComfyUI's work"""
+
+        # Let ComfyUI do its normal patching
+        if not hasattr(model_patcher.model, 'current_weight_patches_uuid'):
+            # Trigger ComfyUI's load mechanism
+            original_device = model_patcher.load_device
+            model_patcher.load(original_device)
+
+        # Now fix version counters on the entire model
+        with torch.inference_mode(False), torch.no_grad():
+            for name, param in model_patcher.model.named_parameters():
+                if param is not None:
+                    try:
+                        _ = param._version
+                    except:
+                        # Clone to get version counter
+                        comfy.utils.set_attr_param(
+                            model_patcher.model,
+                            name,
+                            param.data.clone()
+                        )
+        return model_patcher
+
+    def normalize_inference_model_patcher(self, model_patcher, verbose=False, attr_names=None):
+
+        # Step 2: Apply object patches (from patch_model)
+        for k in model_patcher.object_patches:
+            old = comfy.utils.set_attr(model_patcher.model, k, model_patcher.object_patches[k])
+            if k not in model_patcher.object_patches_backup:
+                model_patcher.object_patches_backup[k] = old
+
+        # Step 3: Apply weight patches WITHOUT the splitting logic
+        # This replicates the patching part of load() but stops before module iteration
+        if len(model_patcher.patches) > 0:
+            print(f"Applying {len(model_patcher.patches)} weight patches...")
+
+            # Unpatch any existing hooks first (as load() does)
+            model_patcher.unpatch_hooks()
+
+            # Apply each weight patch
+            for key in model_patcher.patches:
+                # Determine device for this weight based on ComfyUI's logic
+                device_to = model_patcher.load_device
+
+                # Get the weight
+                weight, set_func, convert_func = get_key_weight(model_patcher.model, key)
+
+                # Backup original weight
+                if key not in model_patcher.backup:
+                    model_patcher.backup[key] = collections.namedtuple('Dimension', ['weight', 'inplace_update'])(
+                        weight.to(device=model_patcher.offload_device, copy=False),
+                        False
+                    )
+
+                # Move to appropriate device and convert to float32 for patching
+                if device_to is not None:
+                    temp_weight = comfy.model_management.cast_to_device(weight, device_to, torch.float32, copy=True)
+                else:
+                    temp_weight = weight.to(torch.float32, copy=True)
+
+                if convert_func is not None:
+                    temp_weight = convert_func(temp_weight, inplace=True)
+
+                # Apply patches
+                out_weight = comfy.lora.calculate_weight(model_patcher.patches[key], temp_weight, key)
+
+                # Apply the patched weight
+                # if set_func is None:
+                #     out_weight = comfy.float.stochastic_rounding(out_weight, weight.dtype, seed=string_to_seed(key))
+                #     comfy.utils.set_attr_param(model_patcher.model, key, out_weight)
+                # else:
+                #     set_func(out_weight, inplace_update=False, seed=string_to_seed(key))
+
+                # Apply the patched weight with version counter preservation
+                if set_func is None:
+                    # Use your working healing approach instead of stochastic_rounding
+                    out_weight = comfy.model_management.cast_to_device(out_weight, out_weight.device, weight.dtype,
+                                                                       copy=True)
+                    comfy.utils.set_attr_param(model_patcher.model, key, out_weight)
+                else:
+                    # For set_func, ensure the tensor has version tracking
+                    with torch.inference_mode(False):
+                        healed_weight = comfy.model_management.cast_to_device(out_weight, out_weight.device,
+                                                                              weight.dtype, copy=True)
+                        set_func(healed_weight, inplace_update=False, seed=string_to_seed(key))
+
+            # Step 4: Apply model patches to device (from load())
+            model_patcher.model_patches_to(model_patcher.load_device)
+            model_patcher.model_patches_to(model_patcher.model.model_dtype())
+
+            # Step 5: Set model state (but don't do the module splitting)
+            model_patcher.model.model_lowvram = False
+            model_patcher.model.lowvram_patch_counter = 0
+            model_patcher.model.device = model_patcher.load_device
+            model_patcher.model.current_weight_patches_uuid = model_patcher.patches_uuid
+
+            # Step 6: Apply forced hooks if any
+            if hasattr(model_patcher, 'forced_hooks') and model_patcher.forced_hooks:
+                model_patcher.apply_hooks(model_patcher.forced_hooks, force_apply=True)
+
+            # Step 7: Inject model
+            model_patcher.inject_model()
+
+        return model_patcher
 
     def normalize_inference_params(self, model_patcher, verbose=False, attr_names=None):
         """
