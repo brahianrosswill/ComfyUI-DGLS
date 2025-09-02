@@ -4,6 +4,8 @@ import torch
 from safetensors.torch import load_file
 import comfy.model_detection
 import gc
+import comfy.utils
+import comfy.model_management
 """
 DGLS Model Loader for ComfyUI by obisin
 ============================
@@ -18,10 +20,10 @@ Author: obisin
 """
 
 # =============================================================================
-# MODEL LOADER by obisin
+# EXTRACTION by obisin
 # =============================================================================
 
-def extract_layers_from_comfy_model(model_patcher):
+def extract_layers_from_comfy_model(model_patcher, verbose):
     """Extract ComfyUI's layers from different model architectures"""
 
     if hasattr(model_patcher.model, 'diffusion_model'):
@@ -44,7 +46,6 @@ def extract_layers_from_comfy_model(model_patcher):
                     # Debug: Check the forward signature
                     import inspect
                     sig = inspect.signature(block.forward)
-                    print(f"Block {i} forward signature: {sig}")
                 print(f"Added {len(dm.double_blocks)} double_blocks")
 
             if hasattr(dm, 'single_blocks'):
@@ -141,15 +142,20 @@ def extract_layers_from_comfy_model(model_patcher):
         return []
 
 
-def add_to_layers_method(model_patcher):
+def add_to_layers_method(model_patcher,verbose):
     """Add to_layers method to model so it works like your training code"""
 
     def to_layers():
-        return extract_layers_from_comfy_model(model_patcher)
+        return extract_layers_from_comfy_model(model_patcher, verbose=verbose)
 
     # Add the method to the model_patcher so you can call model.to_layers()
     model_patcher.to_layers = to_layers
     return model_patcher
+
+
+# =============================================================================
+# MODEL LOADER by obisin
+# =============================================================================
 
 
 class DGLSModelLoader:
@@ -230,11 +236,8 @@ class DGLSModelLoader:
                 sd = torch.load(model_path, map_location='cpu')
 
             print(f"Sample state dict keys: {list(sd.keys())[:5]}")
-
-
             detected_config = comfy.model_detection.model_config_from_unet(sd, "")
             detected_type = type(detected_config).__name__
-
             print(f"ComfyUI auto-detected: {detected_type}")
 
         if model_type == "hunyuan":
@@ -254,9 +257,9 @@ class DGLSModelLoader:
         else:
             model_patcher = comfy.sd.load_diffusion_model(model_path, model_options=model_options)
 
-        model_patcher = add_to_layers_method(model_patcher)
+        fixed = self.normalize_inference_params(model_patcher, verbose=verbose)
 
-        # Extract layers
+        model_patcher = add_to_layers_method(model_patcher, verbose=verbose)
         layers = model_patcher.to_layers()
 
         if verbose:
@@ -264,6 +267,77 @@ class DGLSModelLoader:
             print(f"Total layers extracted: {len(layers)}")
 
         return (model_patcher, layers)
+
+    # =============================================================================
+    # TENSOR FIXES by obisin
+    # =============================================================================
+
+    def normalize_inference_params(self, model_patcher, verbose=False, attr_names=None):
+        """
+        Ensure all params, buffers, and common forward-only tensor attrs are
+        'normal' tensors (have a version counter) like Comfy does before patching.
+        """
+        model = model_patcher.model
+        fixed_params = fixed_bufs = fixed_attrs = 0
+
+        # helper: does this tensor have a tracked version counter?
+        def tracks_version(t: torch.Tensor) -> bool:
+            try:
+                _ = t._version
+                return True
+            except Exception:
+                return False
+
+        # helper: force fresh storage
+        def heal(t: torch.Tensor) -> torch.Tensor:
+            return comfy.model_management.cast_to_device(t, t.device, t.dtype, copy=True)
+
+        # common attr names seen in WAN/Flux-style blocks
+        TENSOR_ATTRS = set(attr_names or [
+            "modulation", "freqs", "pe", "vec", "norm", "scale",
+            "pos_embed", "time_embed", "label_embed", "positional_encoding",
+        ])
+
+        with torch.inference_mode(False), torch.no_grad():
+            # 1) Parameters: replace via Comfy utils so dotted names are handled
+            for name, p in model.named_parameters(recurse=True):
+                if p is None or tracks_version(p):
+                    continue
+                comfy.utils.set_attr_param(model, name, heal(p))
+                fixed_params += 1
+
+            # 2) re-register at the owner module, preserving persistence
+            for name, b in model.named_buffers(recurse=True):
+                if b is None or tracks_version(b):
+                    continue
+                owner, attr = name.rsplit(".", 1) if "." in name else ("", name)
+                mod = comfy.utils.get_attr(model, owner) if owner else model
+                # preserve persistent flag if the module had it non-persistent
+                persistent = True
+                nps = getattr(mod, "_non_persistent_buffers_set", None)
+                if isinstance(nps, set) and attr in nps:
+                    persistent = False
+                mod.register_buffer(attr, heal(b), persistent=persistent)
+                fixed_bufs += 1
+
+            # 3) Plain tensor attributes used in forward that aren't params/buffers
+            for m in model.modules():
+                for an in TENSOR_ATTRS:
+                    if not hasattr(m, an):
+                        continue
+                    t = getattr(m, an)
+                    if isinstance(t, torch.Tensor) and not tracks_version(t):
+                        setattr(m, an, heal(t))
+                        fixed_attrs += 1
+
+        if verbose:
+            print(f"normalize_inference_params: params={fixed_params}, buffers={fixed_bufs}, attrs={fixed_attrs}")
+        return fixed_params + fixed_bufs + fixed_attrs
+
+
+    # =============================================================================
+    # CACHE CLEARING by obisin
+    # =============================================================================
 
     def clear_model_cache_only(self):
         """Safely clear only model-related caches, preserve node execution cache"""
@@ -302,6 +376,7 @@ class DGLSModelLoader:
                     server.cache.outputs.clear()
                     server.cache.ui.clear()
                     server.cache.objects.clear()
+                    torch.cuda.synchronize()
                     print("  Execution cache cleared - other nodes may reload")
         except Exception as e:
             print(f"  Could not clear execution cache: {e}")
