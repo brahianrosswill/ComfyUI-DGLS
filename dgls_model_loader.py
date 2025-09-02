@@ -283,22 +283,17 @@ class DGLSModelLoader:
     # =============================================================================
 
     def ensure_model_ready(self, model_patcher, verbose=False):
-        """Ensure model is ready for inference without duplicating ComfyUI's work"""
-
-        # Let ComfyUI do its normal patching
+        """Ensure model ready without large allocation"""
         if not hasattr(model_patcher.model, 'current_weight_patches_uuid'):
-            # Trigger ComfyUI's load mechanism
-            original_device = model_patcher.load_device
-            model_patcher.load(original_device)
+            model_patcher.model.current_weight_patches_uuid = model_patcher.patches_uuid
 
-        # Now fix version counters on the entire model
+        # Fix version counters
         with torch.inference_mode(False), torch.no_grad():
             for name, param in model_patcher.model.named_parameters():
                 if param is not None:
                     try:
                         _ = param._version
                     except:
-                        # Clone to get version counter
                         comfy.utils.set_attr_param(
                             model_patcher.model,
                             name,
