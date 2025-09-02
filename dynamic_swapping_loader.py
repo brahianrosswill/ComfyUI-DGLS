@@ -223,79 +223,31 @@ def debug_layer_locations(layers, device_cache):
 # DYNAMIC LAYER SWAPPING INFERENCE for Comfy-UI - by obisin
 # =============================================================================
 
-def _has_version_counter(t: torch.Tensor) -> bool:
-    try:
-        _ = t._version
-        return True
-    except (RuntimeError, AttributeError):
-        return False
-
-# def fix_inference_tensor_parameters(layer):
-#     """
-#     Ensure all tensors owned by this module have a normal version counter.
-#     """
-#     fixed = False
-#     with torch.inference_mode(False), torch.no_grad():
-#         # 1) Parameters: re-register as fresh Parameters if needed
-#         for name, p in list(layer.named_parameters(recurse=False)):
-#             if p is not None and not _has_version_counter(p):
-#                 new_p = p.detach().to(p.device, p.dtype)
-#                 setattr(layer, name, torch.nn.Parameter(new_p, requires_grad=False))
-#                 fixed = True
-#
-#         # 2) Buffers: re-register if needed
-#         for name, b in list(layer.named_buffers(recurse=False)):
-#             if b is not None and not _has_version_counter(b):
-#                 new_b = b.detach().to(b.device, b.dtype)
-#                 layer.register_buffer(name, new_b, persistent=True)
-#                 fixed = True
-#
-#         # 3) Plain tensor attributes used by WAN/Flux blocks
-#         tensor_attrs = ["modulation", "freqs", "pe", "vec", "norm", "scale",
-#                        "pos_embed", "time_embed", "label_embed"]
-#         for attr_name in tensor_attrs:
-#             if hasattr(layer, attr_name):
-#                 t = getattr(layer, attr_name)
-#                 if isinstance(t, torch.Tensor) and not _has_version_counter(t):
-#                     new_t = t.detach().to(t.device, t.dtype)
-#                     setattr(layer, attr_name, new_t)
-#                     fixed = True
-#
-#     return fixed
-#
 def fix_inference_tensor_parameters(layer):
-    """
-    Ensure all tensors owned by this module have a normal version counter.
-    """
-    fixed = False
+    def needs_version_fix(t: torch.Tensor) -> bool:
+        try:
+            _ = t._version
+            return False  # Has version counter
+        except Exception:
+            return True  # Needs fixing
+
+    # Quick scan first - early exit if nothing needs fixing
+    for name, p in layer.named_parameters(recurse=False):
+        if p is not None and needs_version_fix(p):
+            break
+    else:
+        return False  # Nothing needs fixing
+
+    # Only fix what needs fixing
     with torch.inference_mode(False), torch.no_grad():
-        # 1) Parameters: re-register using ComfyUI's safe casting
         for name, p in list(layer.named_parameters(recurse=False)):
-            if p is not None and not _has_version_counter(p):
-                new_p = comfy.model_management.cast_to_device(p, p.device, p.dtype, copy=False)
-                setattr(layer, name, torch.nn.Parameter(new_p, requires_grad=False))
-                fixed = True
-
-        # 2) Buffers: re-register using ComfyUI's safe casting
-        for name, b in list(layer.named_buffers(recurse=False)):
-            if b is not None and not _has_version_counter(b):
-                new_b = comfy.model_management.cast_to_device(b, b.device, b.dtype, copy=False)
-                layer.register_buffer(name, new_b, persistent=True)
-                fixed = True
-
-        # 3) Plain tensor attributes used by WAN/Flux blocks
-        tensor_attrs = ["modulation", "freqs", "pe", "vec", "norm", "scale",
-                       "pos_embed", "time_embed", "label_embed"]
-        for attr_name in tensor_attrs:
-            if hasattr(layer, attr_name):
-                t = getattr(layer, attr_name)
-                if isinstance(t, torch.Tensor) and not _has_version_counter(t):
-                    new_t = comfy.model_management.cast_to_device(t, t.device, t.dtype, copy=False)
-                    setattr(layer, attr_name, new_t)
-                    fixed = True
-
-    return fixed
-
+            if p is not None and needs_version_fix(p):
+                new_p = torch.nn.Parameter(
+                    torch.empty_like(p).copy_(p),
+                    requires_grad=False
+                )
+                setattr(layer, name, new_p)
+    return True
 
 def get_cached_layer_size_mb(idx):
     size = layer_sizes_mb.get(idx, 0)
@@ -405,10 +357,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.4 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.4 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -648,8 +600,6 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
     if not hasattr(layer, '_original_forward'):
         layer._original_forward = layer.forward
 
-
-
     if not getattr(layer, "_dgls_fixed", False):
         if fix_inference_tensor_parameters(layer):
             pass  # fixed something
@@ -807,40 +757,6 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         return x  # Pass input through unchanged
 
 
-                # def move_to_device(tensor, target_device):
-                #     if not isinstance(tensor, torch.Tensor):
-                #         return tensor
-                #     # Fix inference mode tensors BEFORE moving
-                #     if hasattr(tensor, 'device'):
-                #         # Check if tensor needs inference mode fix
-                #         try:
-                #             _ = tensor._version
-                #             fixed_tensor = tensor
-                #         except (RuntimeError, AttributeError):
-                #             # Clone to get normal tensor
-                #             with torch.inference_mode(False), torch.no_grad():
-                #                 fixed_tensor = tensor.detach()#.clone()
-                #
-                #         # Move to target device
-                #         if fixed_tensor.device != target_device:
-                #             return fixed_tensor.to(target_device, non_blocking=True)
-                #         else:
-                #             return fixed_tensor
-                #
-                #     return tensor
-
-                # def move_to_device(tensor, target_device):
-                #     if isinstance(tensor, torch.Tensor) and hasattr(tensor, 'device'):
-                #         if tensor.device != target_device:
-                #             return tensor.to(target_device, non_blocking=True)
-                #     return tensor
-
-
-                # def move_to_device(tensor, target_device):
-                #     if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
-                #         return tensor.to(target_device, non_blocking=True)
-                #     return tensor
-
                 def move_to_device(tensor, target_device):
                     if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
                         return comfy.model_management.cast_to_device(tensor, target_device, tensor.dtype, copy=False)
@@ -884,28 +800,13 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         if args.verbose:
                             compute_start = time.perf_counter()
 
-                        # === NEW: ensure default stream waits on H2D completion ===
+                        #  ensure default stream waits on H2D completion
                         if args.cuda_streams and layer_idx in cpu_swappable_layers:
                             if hasattr(add_smart_swapping_to_layer, 'transfer_events'):
                                 ev = add_smart_swapping_to_layer.transfer_events.get(layer_idx)
                                 if ev is not None:
                                     torch.cuda.current_stream().wait_event(ev)
 
-                        # if args.cuda_streams and hasattr(add_smart_swapping_to_layer, 'compute_stream'):
-                        #     with torch.cuda.stream(add_smart_swapping_to_layer.compute_stream):
-                        #         # fix_inference_tensor_parameters(layer)
-                        #         if is_flux_call:
-                        #             if fwd_args:
-                        #                 result = original_forward(*new_args, **new_kwargs)
-                        #             else:
-                        #                 result = original_forward(**new_kwargs)
-                        #
-                        #         elif is_keyword_only_call:
-                        #             result = original_forward(**new_kwargs)
-                        #         else:
-                        #             result = original_forward(x, *new_args, **new_kwargs)
-                        # else:
-                        # fix_inference_tensor_parameters(layer)
                         if is_flux_call:
                             if fwd_args:
                                 result = original_forward(*new_args, **new_kwargs)
@@ -1026,6 +927,7 @@ class DynamicSwappingLoader:
                                  cast_target="",  cuda_streams=False, cpu_threading=False):
         global gpu_resident_layers, cpu_swappable_layers, device_cache
 
+
         def _teardown_swapping_state():
             """Complete cleanup of all modified layers and global state"""
             global layers, device_cache, gpu_resident_layers, cpu_swappable_layers
@@ -1040,7 +942,6 @@ class DynamicSwappingLoader:
                         delattr(layer, '_dgls_swapped')
                     if hasattr(layer, '_dgls_fixed'):
                         delattr(layer, '_dgls_fixed')
-
 
             # Kill thread pool unconditionally
             if hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
@@ -1453,20 +1354,6 @@ class DynamicSwappingLoader:
                 layers,
                 gpu_resident_layers,
                 cpu_swappable_layers)
-
-        if args.verbose:
-            print("Verifying tensor fixes...")
-            problematic_layers = []
-            for i, layer in enumerate(layers):
-                for name, param in layer.named_parameters():
-                    if not _has_version_counter(param):
-                        problematic_layers.append(i)
-                        break
-
-            if problematic_layers:
-                print(f"WARNING: Layers {problematic_layers} still have inference tensors")
-            else:
-                print("All layer tensors properly fixed at startup")
 
         if args.verbose:
             print("✓ Dynamic swapping successfully integrated with ComfyUI")
