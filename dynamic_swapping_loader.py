@@ -405,10 +405,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -655,10 +655,10 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
     if not hasattr(layer, '_original_forward'):
         layer._original_forward = layer.forward
 
-    if not getattr(layer, "_dgls_fixed", False):
-        if fix_inference_tensor_parameters(layer):
-            pass  # fixed something
-        layer._dgls_fixed = True
+    # if not getattr(layer, "_dgls_fixed", False):
+    #     if fix_inference_tensor_parameters(layer):
+    #         pass  # fixed something
+    #     layer._dgls_fixed = True
 
     global layers, device_cache
     layers = layers_list
@@ -1317,6 +1317,15 @@ class DynamicSwappingLoader:
                 except StopIteration:
                     pass
 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                # Force memory defragmentation
+                dummy = torch.empty(1, device='cuda')
+                del dummy
+                torch.cuda.empty_cache()
+                print("Memory defragmented")
+
 
             if cast_target:
                 # Parse the cast_target string first
@@ -1437,6 +1446,10 @@ class DynamicSwappingLoader:
                 if broken_tensors:
                     print(f"WARNING: Layer {i} still has broken tensors: {broken_tensors}")
 
+        import comfy.model_management
+        old_vram_state = comfy.model_management.vram_state
+        comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
+
         for layer_idx in cpu_swappable_layers:
             add_smart_swapping_to_layer(
                 layers[layer_idx],
@@ -1447,6 +1460,8 @@ class DynamicSwappingLoader:
 
         if args.verbose:
             print("✓ Dynamic swapping successfully integrated with ComfyUI")
+
+        comfy.model_management.vram_state = old_vram_state
 
         return (model,)
 
