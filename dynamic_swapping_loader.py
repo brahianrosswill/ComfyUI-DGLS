@@ -120,6 +120,8 @@ layers = None
 cpu_swappable_layers = set()
 gpu_resident_layers = set()
 
+gpu_occupied_swappable = set()
+
 GPU_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CPU_DEVICE = 'cpu'
 
@@ -249,6 +251,52 @@ def fix_inference_tensor_parameters(layer):
                 setattr(layer, name, new_p)
     return True
 
+# def fix_inference_tensor_parameters(layer):
+#     """Fix all tensor parameters to have version tracking - comprehensive version"""
+#
+#     def needs_version_fix(t: torch.Tensor) -> bool:
+#         try:
+#             _ = t._version
+#             return False  # Has version counter
+#         except Exception:
+#             return True  # Needs fixing
+#
+#     fixed_count = 0
+#
+#     with torch.inference_mode(False), torch.no_grad():
+#         # Fix parameters
+#         for name, p in list(layer.named_parameters(recurse=False)):
+#             if p is not None and needs_version_fix(p):
+#                 # Create new parameter with version tracking
+#                 new_p = torch.nn.Parameter(
+#                     torch.empty_like(p, device=p.device, dtype=p.dtype).copy_(p),
+#                     requires_grad=False
+#                 )
+#                 setattr(layer, name, new_p)
+#                 fixed_count += 1
+#
+#         # Fix buffers
+#         for name, b in list(layer.named_buffers(recurse=False)):
+#             if b is not None and needs_version_fix(b):
+#                 # Re-register buffer with version tracking
+#                 new_b = torch.empty_like(b, device=b.device, dtype=b.dtype).copy_(b)
+#                 layer.register_buffer(name, new_b, persistent=True)
+#                 fixed_count += 1
+#
+#         # Fix any direct tensor attributes that might exist
+#         tensor_attrs = ['modulation', 'freqs', 'pe', 'vec', 'norm', 'scale',
+#                         'pos_embed', 'time_embed', 'label_embed', 'positional_encoding']
+#
+#         for attr_name in tensor_attrs:
+#             if hasattr(layer, attr_name):
+#                 attr = getattr(layer, attr_name)
+#                 if isinstance(attr, torch.Tensor) and needs_version_fix(attr):
+#                     new_attr = torch.empty_like(attr, device=attr.device, dtype=attr.dtype).copy_(attr)
+#                     setattr(layer, attr_name, new_attr)
+#                     fixed_count += 1
+#
+#     return fixed_count > 0
+
 def get_cached_layer_size_mb(idx):
     size = layer_sizes_mb.get(idx, 0)
     if size == 0:
@@ -357,10 +405,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.4 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.4 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -442,17 +490,22 @@ def calculate_needed_layers(layer_idx, prefetch):
 
 def cleanup_excess_layers(keep_layers):
     """Remove layers from GPU that are not in keep_layers set - unified threading"""
-    layers_to_remove = []
-    for idx in cpu_swappable_layers:
-        if (idx < len(layers) and
-                idx not in keep_layers and
-                device_cache.get_device(idx).type == 'cuda'):
-            layers_to_remove.append(idx)
+
+    global gpu_occupied_swappable
+    layers_to_remove = gpu_occupied_swappable - set(keep_layers)
+
+    # layers_to_remove = []
+    # for idx in cpu_swappable_layers:
+    #     if (idx < len(layers) and
+    #             idx not in keep_layers and
+    #             device_cache.get_device(idx).type == 'cuda'):
+    #         layers_to_remove.append(idx)
 
     if not layers_to_remove:
         return 0
 
     def unified_cleanup_transfer():
+        global gpu_occupied_swappable
         cleaned_count = 0
         for idx in layers_to_remove:
             if args.verbose:
@@ -473,7 +526,7 @@ def cleanup_excess_layers(keep_layers):
                 end_event.synchronize()
                 transfer_time = start_event.elapsed_time(end_event)
                 add_smart_swapping_to_layer.layer_transfer_times[idx].append(transfer_time)
-
+        gpu_occupied_swappable -= layers_to_remove
         return cleaned_count
 
     if args.cpu_threading and hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
@@ -492,12 +545,14 @@ def cleanup_excess_layers(keep_layers):
 
 def fetch_missing_layers(needed_layers, current_layer_idx=None):
     """Ensure all needed layers are on GPU - unified threading with selective waiting"""
+    global gpu_occupied_swappable
 
     def _fetch_operation():
-        layers_to_fetch = [idx for idx in needed_layers
-                           if (idx < len(layers) and
-                               idx in cpu_swappable_layers and
-                               device_cache.get_device(idx).type == 'cpu')]
+        layers_to_fetch = set(needed_layers) - gpu_occupied_swappable
+        # layers_to_fetch = [idx for idx in needed_layers
+        #                    if (idx < len(layers) and
+        #                        idx in cpu_swappable_layers and
+        #                        device_cache.get_device(idx).type == 'cpu')]
 
         fetched_count = 0
         transfer_start = time.perf_counter()
@@ -521,9 +576,7 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
 
             if hasattr(add_smart_swapping_to_layer, 'transfer_events'):
                 add_smart_swapping_to_layer.transfer_events[idx] = transfer_event
-                # Cap events dict at 50 entries
                 if len(add_smart_swapping_to_layer.transfer_events) > 40:
-                    # Remove oldest 10 entries
                     oldest_keys = list(add_smart_swapping_to_layer.transfer_events.keys())[:10]
                     for key in oldest_keys:
                         del add_smart_swapping_to_layer.transfer_events[key]
@@ -547,9 +600,11 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
                     with torch.cuda.stream(add_smart_swapping_to_layer.fetch_stream):
                         for idx in layers_to_fetch:
                             transfer_single_layer(idx)
+                    gpu_occupied_swappable.update(layers_to_fetch)
                 else:
                     for idx in layers_to_fetch:
                         transfer_single_layer(idx)
+                    gpu_occupied_swappable.update(layers_to_fetch)
             return fetched_count
 
         # Use threading if enabled
@@ -617,6 +672,7 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
 
     @wraps(original_forward)
     def swapped_forward(*fwd_args, **kwargs):
+        # cached_device = device_cache.get_device(layer_idx)
         def _whole_forward_operation():
             layer_compute_start = time.perf_counter()
             overlap_stats['compute_start_times'][layer_idx] = layer_compute_start
@@ -643,7 +699,7 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         needed_layers = calculate_needed_layers(layer_idx, args.prefetch)
                         cleaned = cleanup_excess_layers(needed_layers)
                         fetched = fetch_missing_layers(needed_layers, current_layer_idx=layer_idx)
-                        final_device = device_cache.get_device(layer_idx)
+                        # final_device = device_cache.get_device(layer_idx)
 
                     if layer_already_on_gpu:
                         add_smart_swapping_to_layer.prefetch_hits += 1
@@ -1250,6 +1306,16 @@ class DynamicSwappingLoader:
             print(f"✓ {len(cpu_swappable_layers)} layers on CPU with smart swapping: {sorted(cpu_swappable_layers)}")
 
             add_smart_swapping_to_layer.first_swappable = (min(cpu_swappable_layers) if cpu_swappable_layers else None)
+            global gpu_occupied_swappable
+            gpu_occupied_swappable = set()
+            for i in cpu_swappable_layers:
+                # Check actual device of each swappable layer at start
+                try:
+                    param = next(layers[i].parameters())
+                    if param.device.type == 'cuda':
+                        gpu_occupied_swappable.add(i)
+                except StopIteration:
+                    pass
 
 
             if cast_target:
@@ -1341,11 +1407,35 @@ class DynamicSwappingLoader:
                 print("===============================\n")
                 print()
 
-        # # Add this after casting
+        # #DEBUGGING: Add this after casting
         # for i in [15, 20, 25]:  # Sample swappable layers
         #     for name, param in layers[i].named_parameters():
         #         print(
         #             f"CHECK: Layer {i} param {name}: {param.dtype}, size: {param.numel() * param.element_size() / 1024 ** 2:.1f}MB")
+
+        print("Fixing inference tensor parameters...")
+        total_fixed = 0
+        for i, layer in enumerate(layers):
+            if not getattr(layer, "_dgls_fixed", False):
+                if fix_inference_tensor_parameters(layer):
+                    total_fixed += 1
+                layer._dgls_fixed = True
+
+        if args.verbose and total_fixed > 0:
+            print(f"Fixed inference parameters in {total_fixed} layers")
+
+        if args.verbose:
+            print("Validating tensor parameters...")
+            for i, layer in enumerate(layers):
+                broken_tensors = []
+                for name, param in layer.named_parameters():
+                    try:
+                        _ = param._version
+                    except Exception:
+                        broken_tensors.append(f"{name}")
+
+                if broken_tensors:
+                    print(f"WARNING: Layer {i} still has broken tensors: {broken_tensors}")
 
         for layer_idx in cpu_swappable_layers:
             add_smart_swapping_to_layer(
