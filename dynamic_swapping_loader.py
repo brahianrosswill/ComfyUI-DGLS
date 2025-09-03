@@ -655,10 +655,10 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
     if not hasattr(layer, '_original_forward'):
         layer._original_forward = layer.forward
 
-    # if not getattr(layer, "_dgls_fixed", False):
-    #     if fix_inference_tensor_parameters(layer):
-    #         pass  # fixed something
-    #     layer._dgls_fixed = True
+    if not getattr(layer, "_dgls_fixed", False):
+        if fix_inference_tensor_parameters(layer):
+            pass  # fixed something
+        layer._dgls_fixed = True
 
     global layers, device_cache
     layers = layers_list
@@ -1848,3 +1848,4 @@ def print_memory_optimization_analysis(layers, args):
         'gpu_layers': list(gpu_layers) if available_for_layers else [],
         'swapping_overhead_gb': swapping_overhead / 1024 ** 3 if available_for_layers else 0
     }
+
