@@ -75,8 +75,7 @@ TOOLTIPS = {
     "prefetch": "Number of layers to prefetch ahead of single layer transfer",
     "cuda_streams": "Enable CUDA streams for copy-compute overlap (needs more VRAM)",
     "cpu_threading": "Enable CPU threading for async CPU transfers (May cause instability on some systems)",
-    "batch_move": "Use batch layer moving (experimental, may cause device issues)",
-    "cast_target": "Cast FROM dtype TO dtype at start-up (e.g., f32 bf16) choices=[f32, bf16, f16, f8_e4m3, f8_e5m2, nf4, fp4]",
+    "cast_target": "Cast FROM dtype TO dtype at start-up (e.g., f32 bf16) choices=[f32, bf16, f16, f8_e4m3, f8_e5m2, nf4, fp4] WARNING: don’t cast to f8/fp4 here unless your kernels support it",
     "verbose": "Enable verbose output with detailed timing and transfer information",
     "pin_memory": "Pin CPU memory for faster async GPU transfers (uses 2x CPU RAM for swappable layers)",
 
@@ -115,12 +114,14 @@ layer_sizes_mb = {}
 pending_gpu_transfers = {}  # {layer_idx: event}
 pending_cpu_transfers = {}  # {layer_idx: event}
 
+gpu_layer_copies = {}  # {layer_idx: gpu_layer_copy}
+
 layers = None
 
 cpu_swappable_layers = set()
 gpu_resident_layers = set()
-
 gpu_occupied_swappable = set()
+pending_pin = set()
 
 GPU_DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CPU_DEVICE = 'cpu'
@@ -134,6 +135,86 @@ swappable_list = None
 # =============================================================================
 # DEBUG FUNCTIONS by obisin
 # =============================================================================
+
+def _layer_pinning_stats(layer: nn.Module):
+
+    def _tensor_nbytes(t: torch.Tensor) -> int:
+        try:
+            return t.numel() * t.element_size()
+        except Exception:
+            return 0
+
+    stats = {
+        "pinned_params": 0, "total_params": 0,
+        "pinned_buffers": 0, "total_buffers": 0,
+        "pinned_bytes": 0,
+    }
+    for _, p in layer.named_parameters(recurse=True):
+        if p is None:
+            continue
+        stats["total_params"] += 1
+        if p.device.type == "cpu" and hasattr(p, "is_pinned") and p.is_pinned():
+            stats["pinned_params"] += 1
+            stats["pinned_bytes"] += _tensor_nbytes(p)
+    for _, b in layer.named_buffers(recurse=True):
+        if b is None:
+            continue
+        stats["total_buffers"] += 1
+        if b.device.type == "cpu" and hasattr(b, "is_pinned") and b.is_pinned():
+            stats["pinned_buffers"] += 1
+            stats["pinned_bytes"] += _tensor_nbytes(b)
+    return stats
+
+
+
+
+def debug_print_pinning_report(layers_list, label: str = "", top_k: int = 8):
+    return
+    def _summarize_pinning(layers_list, top_k: int = 8):
+        total_bytes = 0
+        per_layer = []
+        for i, L in enumerate(layers_list or []):
+            s = _layer_pinning_stats(L)
+            if s["pinned_bytes"] > 0:
+                per_layer.append((i, s["pinned_bytes"], s))
+            total_bytes += s["pinned_bytes"]
+
+        per_layer.sort(key=lambda x: x[1], reverse=True)
+        return total_bytes, per_layer[:top_k]
+
+    total_bytes, top_layers = _summarize_pinning(layers_list, top_k)
+    gb = total_bytes / (1024**3)
+    print(f"[PIN-REPORT] {label}  total_pinned≈{gb:.2f} GB")
+
+    for i, bytes_i, s in top_layers:
+        gb_i = bytes_i / (1024**3)
+        detail = (
+            f"layer={i}  pinned≈{gb_i:.3f} GB  "
+            f"params {s['pinned_params']}/{s['total_params']}  "
+            f"buffers {s['pinned_buffers']}/{s['total_buffers']}"
+        )
+        print(f"  └─ {detail}")
+
+def debug_assert_no_gpu_params(layers_list, label: str = "", ignore: set | None = None):
+    return
+    ignore = ignore or set()
+    leaks = []
+    for i, L in enumerate(layers_list or []):
+        if i in ignore:
+            continue
+        for name, p in L.named_parameters(recurse=True):
+            if p is not None and p.device.type == "cuda":
+                leaks.append((i, "param", name, str(p.shape)))
+        for name, b in L.named_buffers(recurse=True):
+            if b is not None and b.device.type == "cuda":
+                leaks.append((i, "buffer", name, str(b.shape)))
+    if leaks:
+        print(f"[GPU-LEAK] {label}  Found {len(leaks)} tensors still on CUDA:")
+        for (i, kind, name, shape) in leaks[:50]:
+            print(f"  └─ layer={i}  {kind}={name}  shape={shape}")
+    else:
+        print(f"[GPU-LEAK] {label}  OK (no params/buffers on CUDA)")
+
 
 def debug_comfy_casting_memory(layer_idx, operation="unknown"):
     """Track memory around ComfyUI's casting operations"""
@@ -179,6 +260,7 @@ def debug_comfy_memory_state():
 
 def debug_layer_locations(layers, device_cache):
     """Debug exact layer locations and memory usage"""
+    return
     print(f"\n=== LAYER LOCATION DEBUG ===")
 
     if layers is None or device_cache is None:
@@ -225,83 +307,7 @@ def debug_layer_locations(layers, device_cache):
 # DYNAMIC LAYER SWAPPING INFERENCE for Comfy-UI - by obisin
 # =============================================================================
 
-def fix_inference_tensor_parameters(layer):
-    def needs_version_fix(t: torch.Tensor) -> bool:
-        try:
-            _ = t._version
-            return False  # Has version counter
-        except Exception:
-            return True  # Needs fixing
 
-    # Quick scan first - early exit if nothing needs fixing
-    for name, p in layer.named_parameters(recurse=False):
-        if p is not None and needs_version_fix(p):
-            break
-    else:
-        return False  # Nothing needs fixing
-
-    # Only fix what needs fixing
-    with torch.inference_mode(False), torch.no_grad():
-        for name, p in list(layer.named_parameters(recurse=False)):
-            if p is not None and needs_version_fix(p):
-                new_p = torch.nn.Parameter(
-                    torch.empty_like(p).copy_(p),
-                    requires_grad=False
-                )
-                setattr(layer, name, new_p)
-    return True
-
-# def fix_inference_tensor_parameters(layer):
-#     """Fix all tensor parameters to have version tracking - comprehensive version"""
-#
-#     def needs_version_fix(t: torch.Tensor) -> bool:
-#         try:
-#             _ = t._version
-#             return False  # Has version counter
-#         except Exception:
-#             return True  # Needs fixing
-#
-#     fixed_count = 0
-#
-#     with torch.inference_mode(False), torch.no_grad():
-#         # Fix parameters
-#         for name, p in list(layer.named_parameters(recurse=False)):
-#             if p is not None and needs_version_fix(p):
-#                 # Create new parameter with version tracking
-#                 new_p = torch.nn.Parameter(
-#                     torch.empty_like(p, device=p.device, dtype=p.dtype).copy_(p),
-#                     requires_grad=False
-#                 )
-#                 setattr(layer, name, new_p)
-#                 fixed_count += 1
-#
-#         # Fix buffers
-#         for name, b in list(layer.named_buffers(recurse=False)):
-#             if b is not None and needs_version_fix(b):
-#                 # Re-register buffer with version tracking
-#                 new_b = torch.empty_like(b, device=b.device, dtype=b.dtype).copy_(b)
-#                 layer.register_buffer(name, new_b, persistent=True)
-#                 fixed_count += 1
-#
-#         # Fix any direct tensor attributes that might exist
-#         tensor_attrs = ['modulation', 'freqs', 'pe', 'vec', 'norm', 'scale',
-#                         'pos_embed', 'time_embed', 'label_embed', 'positional_encoding']
-#
-#         for attr_name in tensor_attrs:
-#             if hasattr(layer, attr_name):
-#                 attr = getattr(layer, attr_name)
-#                 if isinstance(attr, torch.Tensor) and needs_version_fix(attr):
-#                     new_attr = torch.empty_like(attr, device=attr.device, dtype=attr.dtype).copy_(attr)
-#                     setattr(layer, attr_name, new_attr)
-#                     fixed_count += 1
-#
-#     return fixed_count > 0
-
-def get_cached_layer_size_mb(idx):
-    size = layer_sizes_mb.get(idx, 0)
-    if size == 0:
-        print(f"WARNING: Layer {idx} size not found in cache")
-    return size
 
 class LayerDeviceCache:
     def __init__(self, model, layers):  # Add layers parameter
@@ -332,17 +338,168 @@ class LayerDeviceCache:
         """Update cache when we move a layer"""
         self.cache[layer_idx] = new_device
 
-def _pin_layer_cpu_tensors(layer):
-    """Pin CPU tensors for real async transfers"""
-    with torch.no_grad():
-        for name, p in list(layer.named_parameters(recurse=False)):
-            if p.device.type == 'cpu' and not p.is_pinned():
-                pinned = p.detach().pin_memory()
-                setattr(layer, name, nn.Parameter(pinned, requires_grad=False))
-        for name, b in list(layer.named_buffers(recurse=False)):
-            if b.device.type == 'cpu' and not b.is_pinned():
-                layer.register_buffer(name, b.detach().pin_memory(), persistent=True)
 
+def fix_inference_tensor_parameters(layer):
+    """
+    Ensure every parameter/buffer in `layer` has a proper version counter.
+    Works recursively and handles dotted names by updating the owning submodule.
+    """
+    def needs_version_fix(t: torch.Tensor) -> bool:
+        try:
+            _ = t._version
+            return False
+        except Exception:
+            return True
+
+    fixed = False
+    with torch.inference_mode(False), torch.no_grad():
+        # 1) Parameters (recursive)
+        for name, p in list(layer.named_parameters(recurse=True)):
+            if p is None:
+                continue
+            if needs_version_fix(p):
+                owner, leaf = _owner_and_key(layer, name)  # e.g. "img_attn.qkv.weight"
+                new_p = torch.nn.Parameter(p.detach().contiguous(), requires_grad=False)
+                owner._parameters[leaf] = new_p
+                fixed = True
+
+        # 2) Buffers (recursive)
+        for name, b in list(layer.named_buffers(recurse=True)):
+            if b is None:
+                continue
+            if needs_version_fix(b):
+                owner, leaf = _owner_and_key(layer, name)
+                new_b = b.detach().contiguous()
+                owner._buffers[leaf] = new_b  # keeps persistence semantics
+                fixed = True
+
+    return fixed
+
+def get_cached_layer_size_mb(idx):
+    size = layer_sizes_mb.get(idx, 0)
+    if size == 0:
+        print(f"WARNING: Layer {idx} size not found in cache")
+    return size
+
+def _owner_and_key(module: nn.Module, dotted: str):
+    """Resolve submodule and leaf key for dotted parameter/buffer names."""
+    if '.' in dotted:
+        prefix, leaf = dotted.rsplit('.', 1)
+        owner = module.get_submodule(prefix)
+        return owner, leaf
+    else:
+        return module, dotted
+
+def pin_cpu_memory(layer, idx):
+    """Pin CPU tensors for faster CPU→GPU copies (still CPU)."""
+    MIN_MB = int(getattr(args, 'pin_min_mb', 128))
+    with torch.no_grad():
+        # parameters
+        for name, p in list(layer.named_parameters(recurse=True)):
+            if p is None or p.device.type != 'cpu' or p.is_pinned():
+                continue
+            if get_cached_layer_size_mb(idx) <= MIN_MB:
+                return
+            pinned = p.detach().contiguous().pin_memory()
+            owner, leaf = _owner_and_key(layer, name)
+            owner._parameters[leaf] = nn.Parameter(pinned, requires_grad=False)
+
+        # buffers
+        for name, b in list(layer.named_buffers(recurse=True)):
+            if b is None or b.device.type != 'cpu' or b.is_pinned():
+                continue
+            if get_cached_layer_size_mb(idx) <= MIN_MB:
+                return
+            pinned = b.detach().contiguous().pin_memory()
+            owner, leaf = _owner_and_key(layer, name)
+            owner._buffers[leaf] = pinned
+
+def stage_to_gpu(layer_idx):
+    """
+    One-way CPU→GPU stage for weights:
+      1) stash CPU masters once
+      2) allocate empty GPU storages
+      3) copy payload CPU→GPU (non_blocking)
+      4) point owners' params/buffers at GPU tensors
+    """
+    layer = layers[layer_idx]
+
+    # 1) stash CPU masters (one-time)
+    if not hasattr(layer, '_cpu_params'):
+        layer._cpu_params  = {n: p for n, p in layer.named_parameters(recurse=True)}
+        layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
+
+    with torch.no_grad():
+        # 2) allocate empty GPU storages at the correct owner
+        for n, p_cpu in layer._cpu_params.items():
+            if p_cpu is None:
+                continue
+            owner, leaf = _owner_and_key(layer, n)
+            owner._parameters[leaf] = nn.Parameter(
+                torch.empty_like(p_cpu, device=GPU_DEVICE), requires_grad=False
+            )
+        for n, b_cpu in layer._cpu_buffers.items():
+            if b_cpu is None:
+                continue
+            owner, leaf = _owner_and_key(layer, n)
+            owner._buffers[leaf] = torch.empty_like(b_cpu, device=GPU_DEVICE)
+
+        # 3) copy payload CPU→GPU (respects current stream)
+        for n, p_cpu in layer._cpu_params.items():
+            if p_cpu is None:
+                continue
+            owner, leaf = _owner_and_key(layer, n)
+            owner._parameters[leaf].data.copy_(p_cpu.data, non_blocking=True)
+
+        for n, b_cpu in layer._cpu_buffers.items():
+            if b_cpu is None:
+                continue
+            owner, leaf = _owner_and_key(layer, n)
+            owner._buffers[leaf].data.copy_(b_cpu.data, non_blocking=True)
+
+
+def unpin_cpu_memory(layer):
+    """Convert pinned CPU params/buffers back to regular CPU (releases Shared GPU memory)."""
+    with torch.no_grad():
+        # parameters
+        for name, p in list(layer.named_parameters(recurse=True)):
+            if p is not None and p.device.type == 'cpu' and p.is_pinned():
+                owner, leaf = _owner_and_key(layer, name)
+                new_cpu = p.detach().contiguous()  # non-pinned CPU
+                owner._parameters[leaf] = nn.Parameter(new_cpu, requires_grad=False)
+        # buffers
+        for name, b in list(layer.named_buffers(recurse=True)):
+            if b is not None and b.device.type == 'cpu' and b.is_pinned():
+                owner, leaf = _owner_and_key(layer, name)
+                owner._buffers[leaf] = b.detach().contiguous()
+
+def rebind(layer_idx):
+    """
+    Evict (discard):
+      - rebind params/buffers back to CPU masters
+      - delete GPU storages (no GPU→CPU transfer)
+    """
+    layer = layers[layer_idx]
+    if not hasattr(layer, '_cpu_params'):
+        return
+
+    with torch.no_grad():
+        # parameters
+        for n, p_cpu in layer._cpu_params.items():
+            owner, leaf = _owner_and_key(layer, n)
+            old_gpu = owner._parameters.get(leaf, None)
+            owner._parameters[leaf] = p_cpu
+            if (old_gpu is not None and isinstance(old_gpu, torch.Tensor)
+                    and old_gpu.device.type == 'cuda'):
+                del old_gpu
+        # buffers
+        for n, b_cpu in layer._cpu_buffers.items():
+            owner, leaf = _owner_and_key(layer, n)
+            old_gpu_b = owner._buffers.get(leaf, None)
+            owner._buffers[leaf] = b_cpu
+            if (old_gpu_b is not None and isinstance(old_gpu_b, torch.Tensor)
+                    and old_gpu_b.device.type == 'cuda'):
+                del old_gpu_b
 
 def calculate_auto_gpu_layers(layers, args):
     """Auto-select GPU layers allocation logic with safety mechanisms"""
@@ -405,10 +562,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.33 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -494,13 +651,6 @@ def cleanup_excess_layers(keep_layers):
     global gpu_occupied_swappable
     layers_to_remove = gpu_occupied_swappable - set(keep_layers)
 
-    # layers_to_remove = []
-    # for idx in cpu_swappable_layers:
-    #     if (idx < len(layers) and
-    #             idx not in keep_layers and
-    #             device_cache.get_device(idx).type == 'cuda'):
-    #         layers_to_remove.append(idx)
-
     if not layers_to_remove:
         return 0
 
@@ -513,10 +663,9 @@ def cleanup_excess_layers(keep_layers):
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
 
-            layers[idx].to(CPU_DEVICE)
-            # move_to(layers[idx], CPU_DEVICE)
-            if args.cuda_streams and args.pin_memory:
-                _pin_layer_cpu_tensors(layers[idx])
+            rebind(idx)
+            gpu_layer_copies.pop(idx, None)
+
             device_cache.mark_moved(idx, torch.device('cpu'))
             swap_stats['to_cpu'] += 1
             cleaned_count += 1
@@ -526,6 +675,7 @@ def cleanup_excess_layers(keep_layers):
                 end_event.synchronize()
                 transfer_time = start_event.elapsed_time(end_event)
                 add_smart_swapping_to_layer.layer_transfer_times[idx].append(transfer_time)
+
         gpu_occupied_swappable -= layers_to_remove
         return cleaned_count
 
@@ -549,10 +699,6 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
 
     def _fetch_operation():
         layers_to_fetch = set(needed_layers) - gpu_occupied_swappable
-        # layers_to_fetch = [idx for idx in needed_layers
-        #                    if (idx < len(layers) and
-        #                        idx in cpu_swappable_layers and
-        #                        device_cache.get_device(idx).type == 'cpu')]
 
         fetched_count = 0
         transfer_start = time.perf_counter()
@@ -568,8 +714,12 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
 
-            layers[idx].to(GPU_DEVICE, non_blocking=True)
-            # move_to(layers[idx], GPU_DEVICE)
+            if idx in gpu_layer_copies:
+                gpu_layer_copies.pop(idx, None)
+
+            # One-way
+            stage_to_gpu(idx)
+            gpu_layer_copies[idx] = True
 
             transfer_event = torch.cuda.Event()
             transfer_event.record()
@@ -619,7 +769,6 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
         else:
             fetched_count = unified_gpu_transfer()
 
-
         # Wait only for current layer if specified
         if current_layer_idx is not None and current_layer_idx in layers_to_fetch:
             while True:
@@ -639,7 +788,6 @@ def fetch_missing_layers(needed_layers, current_layer_idx=None):
 
     if not hasattr(fetch_missing_layers, 'step_counter'):
         fetch_missing_layers.step_counter = 0
-
     fetch_missing_layers.step_counter += 1
 
     return _fetch_operation()
@@ -677,16 +825,15 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
             layer_compute_start = time.perf_counter()
             overlap_stats['compute_start_times'][layer_idx] = layer_compute_start
 
-            # Detect new step when we hit layer 0 again (reset to early layers)
-            # In swapped_forward, after the new step detection:
-            if args.verbose and layer_idx == add_smart_swapping_to_layer.first_swappable:
+            # Detect new step when we hit layer 0
+            if layer_idx == add_smart_swapping_to_layer.first_swappable:
                 add_smart_swapping_to_layer.current_step += 1
                 add_smart_swapping_to_layer.calls_this_step = 0
                 if args.verbose:
                     print(f" New sampling step {add_smart_swapping_to_layer.current_step}")
 
-                    if add_smart_swapping_to_layer.current_step % 3 == 0:
-                        analyze_layer_performance()
+                    # if add_smart_swapping_to_layer.current_step % 3 == 0:
+                    #     analyze_layer_performance()
 
             if layer_idx in cpu_swappable_layers:
                 if PROFILE:
@@ -699,7 +846,6 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                         needed_layers = calculate_needed_layers(layer_idx, args.prefetch)
                         cleaned = cleanup_excess_layers(needed_layers)
                         fetched = fetch_missing_layers(needed_layers, current_layer_idx=layer_idx)
-                        # final_device = device_cache.get_device(layer_idx)
 
                     if layer_already_on_gpu:
                         add_smart_swapping_to_layer.prefetch_hits += 1
@@ -750,8 +896,8 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
             add_smart_swapping_to_layer.total_forward_calls += 1
             add_smart_swapping_to_layer.calls_this_step += 1
 
-            if args.verbose and add_smart_swapping_to_layer.total_forward_calls % 100 == 0:
-                print_memory_optimization_analysis(layers, args)
+            # if args.verbose and add_smart_swapping_to_layer.total_forward_calls % 100 == 0:
+            #     print_memory_optimization_analysis(layers, args)
                 # debug_layer_locations(layers, device_cache)
 
             if PROFILE:
@@ -769,15 +915,14 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                     print(f" Layer {layer_idx} failed to be on GPU, forcing aggressive cleanup...")
                     # debug_comfy_memory_state()
 
-                    # ALL cleanup now goes through the thread
                     def emergency_cleanup():
                         for cleanup_idx in cpu_swappable_layers:
-                            if cleanup_idx != layer_idx and cleanup_idx < len(layers):
+                            if cleanup_idx != layer_idx and cleanup_idx in gpu_layer_copies:
                                 try:
-                                    layers[cleanup_idx].to(CPU_DEVICE)
-                                    # move_to(layers[cleanup_idx], CPU_DEVICE)
+                                    rebind(cleanup_idx)  # ensure pointers go back to CPU and VRAM is dropped
+                                    gpu_layer_copies.pop(cleanup_idx, None)
                                     device_cache.mark_moved(cleanup_idx, torch.device('cpu'))
-                                except:
+                                except Exception:
                                     pass
 
                     if args.cpu_threading and hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
@@ -789,10 +934,9 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                    # Try again after cleanup - also through thread
                     def emergency_gpu_move():
-                        layer.to(GPU_DEVICE)
-                        # move_to(layer, GPU_DEVICE)
+                        stage_to_gpu(layer_idx)
+                        gpu_layer_copies[layer_idx] = True
                         device_cache.mark_moved(layer_idx, torch.device('cuda'))
                         return True
 
@@ -936,14 +1080,6 @@ def add_smart_swapping_to_layer(layer, layer_idx, layers_list, gpu_resident_laye
     layer.forward = swapped_forward
     layer._dgls_swapped = True
 
-def move_to(layer, target_device):
-    """Move only weight/bias tensors, not the entire module"""
-    for name, param in layer.named_parameters():
-        if 'weight' in name or 'bias' in name:
-            param.data = param.data.to(target_device, copy=False)
-    for name, buffer in layer.named_buffers():
-        buffer.data = buffer.data.to(target_device, copy=False)
-
 # =============================================================================
 # COMFYUI NODE CLASS - by obisin
 # =============================================================================
@@ -955,13 +1091,13 @@ class DynamicSwappingLoader:
             "required": {
                 "model": ("MODEL",),
                 "layers": ("LAYERS",),
-                "initial_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["initial_gpu_layers"]}),
-                "final_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["final_gpu_layers"]}),
-                "auto_allocate_layers": ("BOOLEAN", {"default": False, "tooltip": "Automatically determine layer placement based on available VRAM. Overrides any other layer placement."}),
+                # "initial_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["initial_gpu_layers"]}),
+                # "final_gpu_layers": ("INT",{"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["final_gpu_layers"]}),
+                # "auto_allocate_layers": ("BOOLEAN", {"default": False, "tooltip": "Automatically determine layer placement based on available VRAM. Overrides any other layer placement."}),
                 "prefetch": ("INT", {"default": 1, "min": 0, "max": 100, "tooltip": TOOLTIPS["prefetch"]}),
                 "cpu_threading": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cpu_threading"]}),
                 "cuda_streams": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cuda_streams"]}),
-                "pin_memory": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["pin_memory"]}),
+                # "pin_memory": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["pin_memory"]}),
                 "verbose": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["verbose"]}),
             },
             "optional": {
@@ -977,16 +1113,21 @@ class DynamicSwappingLoader:
     CATEGORY = "loaders"
     TITLE = "Dynamic Swapping Loader"
 
+    def load_model_with_swapping(self, model, layers, prefetch, verbose,  gpu_layer_indices="",
+                                 cast_target="",pin_memory=False, auto_allocate_layers = True,  cuda_streams=False, cpu_threading=False):
 
-    def load_model_with_swapping(self, model, layers, initial_gpu_layers, final_gpu_layers, auto_allocate_layers,
-                                 prefetch, verbose, pin_memory, gpu_layer_indices="",
-                                 cast_target="",  cuda_streams=False, cpu_threading=False):
         global gpu_resident_layers, cpu_swappable_layers, device_cache
+        initial_gpu_layers = 0
+        final_gpu_layers = 0
 
 
         def _teardown_swapping_state():
             """Complete cleanup of all modified layers and global state"""
             global layers, device_cache, gpu_resident_layers, cpu_swappable_layers
+
+            if args.verbose:
+                debug_print_pinning_report(layers, "BEFORE-TEARDOWN")
+                debug_assert_no_gpu_params(layers, "BEFORE-TEARDOWN")
 
             # Restore original forward methods and move everything to CPU
             if layers is not None:
@@ -998,6 +1139,29 @@ class DynamicSwappingLoader:
                         delattr(layer, '_dgls_swapped')
                     if hasattr(layer, '_dgls_fixed'):
                         delattr(layer, '_dgls_fixed')
+
+            # 2) NEW: make sure everything is truly CPU, drop GPU storages, and UNPIN CPU masters
+            if args.pin_memory:
+                for i, layer in enumerate(layers):
+                    # ensure no lingering GPU storages
+                    try:
+                        rebind(i)  # safe if never staged
+                    except Exception:
+                        pass
+
+                    if args.pin_memory:
+                        try:
+                            unpin_cpu_memory(layer)
+                        except Exception:
+                            pass
+
+                    # drop master refs so Python can GC them
+                    for attr in ('_cpu_params', '_cpu_buffers'):
+                        if hasattr(layer, attr):
+                            try:
+                                delattr(layer, attr)
+                            except Exception:
+                                pass
 
             # Kill thread pool unconditionally
             if hasattr(add_smart_swapping_to_layer, 'cpu_thread_pool'):
@@ -1016,6 +1180,15 @@ class DynamicSwappingLoader:
                     except:
                         pass
 
+            # _final_cuda_sweep_all_layers()
+
+            if args.verbose:
+                if layers is not None:
+                    debug_print_pinning_report(layers, "AFTER-TEARDOWN")
+                    debug_assert_no_gpu_params(layers, "AFTER-TEARDOWN")
+                else:
+                    print("[PIN-REPORT] AFTER-TEARDOWN  (layers=None)")
+
             # Reset globals
             gpu_resident_layers.clear()
             cpu_swappable_layers.clear()
@@ -1024,6 +1197,7 @@ class DynamicSwappingLoader:
 
         # CRITICAL: Complete teardown first
         _teardown_swapping_state()
+
         if args.verbose:
             print(f"VRAM after teardown: {torch.cuda.memory_allocated(0) / 1024 ** 3:.3f}GB")
 
@@ -1079,6 +1253,7 @@ class DynamicSwappingLoader:
         args.verbose = verbose
         args.auto_allocate_layers = auto_allocate_layers
         args.pin_memory = pin_memory
+        should_pin = args.pin_memory
 
         args.gpu_layers = gpu_layer_indices.strip() if gpu_layer_indices.strip() else None
         args.cast_target = cast_target.strip() if cast_target.strip() else None
@@ -1180,28 +1355,12 @@ class DynamicSwappingLoader:
                 print(f"  {i:2d}: {layer_type:<20} | {dtype_str}")
             print("===============================\n")
 
-
-        # #FORCE first and last layer onto card regardless of settings for stability
-        # if gpu_layer_indices and gpu_layer_indices.strip():
-        #     specified_gpu_layers = set(map(int, gpu_layer_indices.split(',')))
-        #
-        #     specified_gpu_layers.add(0)  # First layer
-        #     specified_gpu_layers.add(len(layers) - 1)  # Last layer
-        #     if args.verbose:
-        #         print(f" Automatically added layers 0 and {len(layers) - 1} for stability")
-        # else:
-        #     # Use initial/final logic, but ensure at least 1 initial and 1 final
-        #     initial_gpu_layers = max(1, args.initial_gpu_layers)  # At least 1
-        #     final_gpu_layers = max(1, args.final_gpu_layers)  # At least 1
-
         if args.dynamic_swapping:
             if args.verbose:
             #     print("Applying ENHANCED smart GPU allocation + dynamic swapping...")
                 print(f"Setting up enhanced swapping for {len(layers)} layers...")
 
-            if args.auto_allocate_layers:
-                specified_gpu_layers = calculate_auto_gpu_layers(layers, args)
-            elif args.gpu_layers and not args.auto_allocate_layers:
+            if args.gpu_layers:
                 try:
                     specified_gpu_layers = set(map(int, args.gpu_layers.split(',')))
                     if args.verbose:
@@ -1216,13 +1375,13 @@ class DynamicSwappingLoader:
                     print(f" Error parsing --gpu_layers: {e}")
                     print("Example usage: --gpu_layers 0,1,2,14,18,19,20,21,22")
                     raise e
-            else:
+            elif args.auto_allocate_layers:
+                specified_gpu_layers = calculate_auto_gpu_layers(layers, args)
+
+            else: #CODE SHOULD BBE NOW UNREACHABLE- ONLY AUTO OR YOU PICK YOUR OWN INDICES
                 specified_gpu_layers = None
                 if args.verbose:
                     print(f"Using initial/final layer allocation: {initial_gpu_layers}/{final_gpu_layers}")
-
-            # global current_model
-            # current_model = model
 
             # Clear sets to prevent double-addition from previous runs
             gpu_resident_layers.clear()
@@ -1236,17 +1395,9 @@ class DynamicSwappingLoader:
                         if i in specified_gpu_layers:
                             try:
                                 layer.to(GPU_DEVICE)
-                                # move_to(layer, GPU_DEVICE)
                                 gpu_resident_layers.add(i)  # This is correct - after successful move
                                 if args.verbose:
                                     print(f"Layer {i} (specified) -> GPU permanent")
-
-                                    # ADD: Check memory after each GPU layer
-                                    # if torch.cuda.is_available():
-                                    #     current_memory = torch.cuda.memory_allocated(0)
-                                    #     layer_memory = current_memory - baseline_memory
-                                    #     if args.verbose:
-                                    #         print(f"Layer {i} -> GPU: +{layer_memory / 1024 ** 2:.1f}MB (total: {current_memory / 1024 ** 3:.3f}GB)")
 
                             except RuntimeError as e:
                                 print(f"CRITICAL: Cannot fit specified layer {i} on GPU!")
@@ -1255,9 +1406,13 @@ class DynamicSwappingLoader:
                         else:
                             # Not in specified list, make swappable
                             layer.to(CPU_DEVICE)
-                            if args.cuda_streams and args.pin_memory:
-                                _pin_layer_cpu_tensors(layer)
-                            # move_to(layer, CPU_DEVICE)
+                            if args.pin_memory:
+
+                                pending_pin = locals().get("pending_pin", set())
+                                pending_pin.add(i)
+                            if not hasattr(layer, '_cpu_params'):
+                                layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
+                                layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
                             cpu_swappable_layers.add(i)
                             if args.verbose:
                                 print(f"Layer {i} (not specified) -> CPU swappable")
@@ -1267,20 +1422,23 @@ class DynamicSwappingLoader:
                             # Initial layers on GPU permanently
                             try:
                                 layer.to(GPU_DEVICE)
-                                # move_to(layer, GPU_DEVICE)
                                 gpu_resident_layers.add(i)
                                 if args.verbose:
                                     print(f"Layer {i} (initial) -> GPU permanent")
                             except RuntimeError as e:
                                 print(f"GPU exhausted at layer {i}, moving to CPU with swapping")
                                 layer.to(CPU_DEVICE)
-                                # move_to(layer, CPU_DEVICE)
+                                if args.pin_memory:
+                                    pending_pin = locals().get("pending_pin", set())
+                                    pending_pin.add(i)
+                                if not hasattr(layer, '_cpu_params'):
+                                    layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
+                                    layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
                                 cpu_swappable_layers.add(i)
                         elif i >= (len(layers) - final_gpu_layers):
                             # Final layers on GPU permanently
                             try:
                                 layer.to(GPU_DEVICE)
-                                # move_to(layer, GPU_DEVICE)
                                 gpu_resident_layers.add(i)
                                 if args.verbose:
                                     print(f"Layer {i} (final) -> GPU permanent")
@@ -1290,10 +1448,12 @@ class DynamicSwappingLoader:
                         else:
                             # Middle layers on CPU with swapping capability
                             layer.to(CPU_DEVICE)
-                            if args.cuda_streams and args.pin_memory:
-                                _pin_layer_cpu_tensors(layer)
-                            # move_to(layer, CPU_DEVICE)
-
+                            if args.pin_memory:
+                                pending_pin = locals().get("pending_pin", set())
+                                pending_pin.add(i)
+                            if not hasattr(layer, '_cpu_params'):
+                                layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
+                                layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
                             cpu_swappable_layers.add(i)
                             if args.verbose:
                                 print(f"Layer {i} (middle) -> CPU swappable")
@@ -1317,53 +1477,6 @@ class DynamicSwappingLoader:
                 except StopIteration:
                     pass
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                # Force memory defragmentation
-                dummy = torch.empty(1, device='cuda')
-                del dummy
-                torch.cuda.empty_cache()
-                print("Memory defragmented")
-
-
-            if cast_target:
-                # Parse the cast_target string first
-                try:
-                    cast_from, cast_to = cast_target.strip().split()
-                    parsed_cast_target = (cast_from, cast_to)
-
-                    casting_handler = CastingHandler()
-                    casting_handler.precast_all_layers(cpu_swappable_layers, layers,
-                                                       parsed_cast_target)
-                except ValueError:
-                    print(f"  Invalid cast_target format: '{cast_target}'. Expected: 'from_dtype to_dtype'")
-
-            # if args.verbose:
-            #     if torch.cuda.is_available():
-            #         final_memory = torch.cuda.memory_allocated(0)
-            #         dgls_memory = final_memory - baseline_memory
-            #         print(
-            #             f" DGLS TOTAL MEMORY: {dgls_memory / 1024 ** 3:.3f} GB for {len(gpu_resident_layers)} GPU layers")
-            #         print(f" Average per GPU layer: {dgls_memory / len(gpu_resident_layers) / 1024 ** 2:.1f}MB")
-
-            # print("\n=== Module Size Debug ===")
-            # total_module_mem = 0
-            # for name, module in model.model.named_modules():
-            #     if hasattr(module, 'weight') or len(list(module.parameters())) > 0:
-            #         module_mem = sum(p.numel() * p.element_size() for p in module.parameters())
-            #         if module_mem > 0:
-            #             print(f"Module {name}: {module_mem / 1024 ** 2:.1f} MB")
-            #             total_module_mem += module_mem
-            # print(f"Total module memory: {total_module_mem / 1024 ** 3:.2f} GB")
-
-            global device_cache
-            device_cache = LayerDeviceCache(model, layers)
-
-            if args.verbose:
-                analysis_result = print_memory_optimization_analysis( layers, args)
-                # debug_layer_locations(layers, device_cache)
-
             print("Calculating layer sizes...")
             global layer_sizes_mb
             for i, layer in enumerate(layers):
@@ -1372,6 +1485,77 @@ class DynamicSwappingLoader:
                     print(f"   Layer {i}: {layer_sizes_mb[i]:.1f}MB")
             print()
 
+            if cast_target:
+                # Parse the cast_target string first
+                try:
+                    pairs  = [tuple(ch.strip().split()) for ch in cast_target.split(',') if ch.strip()]
+                    casting_handler = CastingHandler()
+                    casting_handler.precast_all_layers(cpu_swappable_layers, layers, pairs)
+                    if args.pin_memory:
+                        pending_pin.clear()
+                        for idx in cpu_swappable_layers:
+                            pending_pin.add(idx)
+                except ValueError:
+                    print(f"  Invalid cast_target format: '{cast_target}'. Expected: 'from_dtype to_dtype'")
+
+            def _planned_pin_bytes(cpu_swappable_layers, layers) -> int:
+                min_mb = int(getattr(args, 'pin_min_mb', 128))
+                total_mb = 0
+                for i in cpu_swappable_layers:
+                    if get_cached_layer_size_mb(i) >= min_mb:
+                        total_mb += get_cached_layer_size_mb(i)
+                return int(total_mb * 1024 * 1024)
+
+            def _enough_free_ram_for_pin(plan_bytes: int) -> bool:
+                # keep a headroom so the OS stays happy
+                try:
+                    import psutil
+                    vm = psutil.virtual_memory()
+                    # reserve at least 6GB or 20% of total, whichever larger
+                    reserve = max(5 * 1024 ** 3, int(0.1 * vm.total))
+                    return plan_bytes + reserve <= vm.available
+                except Exception:
+
+                    baseline = 64 * 1024 ** 3
+                    reserve = int(0.1 * baseline)
+                    return plan_bytes <= reserve
+
+            if args.pin_memory:
+                plan = _planned_pin_bytes(cpu_swappable_layers, layers)
+                if args.verbose:
+                    print(f"[PINNING] planned={plan / 1024 ** 2:.1f} MB, gate>= {getattr(args, 'pin_min_mb', 128)} MB per layer")
+                if not _enough_free_ram_for_pin(plan):
+                    print("[PINNING] Disabled: not enough free RAM for pinning.")
+                    should_pin = False
+
+            if should_pin:
+                for idx in sorted(pending_pin):
+                    L = layers[idx]
+                    pin_cpu_memory(L, idx)  # whole-layer pin
+                    # refresh masters to the now-pinned tensors
+                    L._cpu_params = {n: p for n, p in L.named_parameters(recurse=True)}
+                    L._cpu_buffers = {n: b for n, b in L.named_buffers(recurse=True)}
+
+            if args.verbose:
+                debug_print_pinning_report(layers, "AFTER-SETUP")
+                debug_assert_no_gpu_params(layers, "AFTER-SETUP", ignore=gpu_resident_layers)
+
+                # print("\n=== Module Size Debug ===")
+                # total_module_mem = 0
+                # for name, module in model.model.named_modules():
+                #     if hasattr(module, 'weight') or len(list(module.parameters())) > 0:
+                #         module_mem = sum(p.numel() * p.element_size() for p in module.parameters())
+                #         if module_mem > 0:
+                #             print(f"Module {name}: {module_mem / 1024 ** 2:.1f} MB")
+                #             total_module_mem += module_mem
+                # print(f"Total module memory: {total_module_mem / 1024 ** 3:.2f} GB")
+
+            global device_cache
+            device_cache = LayerDeviceCache(model, layers)
+
+            if args.verbose:
+                analysis_result = print_memory_optimization_analysis( layers, args)
+                debug_layer_locations(layers, device_cache)
 
             if cast_target:
                 print(f"\n=== LAYER CASTED DTYPES ===")
@@ -1446,10 +1630,6 @@ class DynamicSwappingLoader:
                 if broken_tensors:
                     print(f"WARNING: Layer {i} still has broken tensors: {broken_tensors}")
 
-        import comfy.model_management
-        old_vram_state = comfy.model_management.vram_state
-        comfy.model_management.vram_state = comfy.model_management.VRAMState.HIGH_VRAM
-
         for layer_idx in cpu_swappable_layers:
             add_smart_swapping_to_layer(
                 layers[layer_idx],
@@ -1458,10 +1638,43 @@ class DynamicSwappingLoader:
                 gpu_resident_layers,
                 cpu_swappable_layers)
 
+        from comfy.patcher_extension import CallbacksMP
+        def _release_pinned(*_a, **_k):
+            if not getattr(args, "pin_memory", False):
+                return
+            # Unpin only what this run marked swappable
+            for idx in cpu_swappable_layers:
+                try:
+                    L = layers[idx]
+                except Exception:
+                    continue
+                try:
+                    unpin_cpu_memory(L)
+                    if hasattr(L, "_cpu_params"):  delattr(L, "_cpu_params")
+                    if hasattr(L, "_cpu_buffers"): delattr(L, "_cpu_buffers")
+                except Exception:
+                    pass
+            try:
+                import torch.cuda.memory as _tcm
+                if hasattr(_tcm, "_host_allocator_emptyCache"):
+                    _tcm._host_allocator_emptyCache()
+            except Exception:
+                pass
+
+        try:
+            model.add_callback(CallbacksMP.ON_DETACH, _release_pinned)
+            print("ON_DETACH worked")
+        except Exception:
+            try:
+                model.add_callback(CallbacksMP.ON_CLEANUP, _release_pinned)
+                print("ON_CLEANUP worked")
+            except Exception:
+                print(f"[PINNING] cleanup registration failed: {e}")
+        gc.collect()
+
         if args.verbose:
             print("✓ Dynamic swapping successfully integrated with ComfyUI")
 
-        comfy.model_management.vram_state = old_vram_state
 
         return (model,)
 
@@ -1544,32 +1757,146 @@ class CastingHandler:
         # No casting needed
         return param.to(target_device, non_blocking=True)
 
-    def precast_all_layers(self, cpu_swappable_layers, layers, cast_target=None):
-        """Cast all layer dtypes once at startup using existing cast_to_dtype"""
+    def _token_to_torch_dtype(self,tok: str):
+        def _normalize_dtype_token(tok: str):
+            t = tok.strip().lower().replace("torch.", "")
+            aliases = {
+                "f32": "float32", "fp32": "float32", "float": "float32", "float32": "float32",
+                "f16": "float16", "fp16": "float16", "half": "float16", "float16": "float16",
+                "bf16": "bfloat16", "bfloat16": "bfloat16",
+                "f8e4m3": "float8_e4m3fn", "e4m3": "float8_e4m3fn", "float8_e4m3": "float8_e4m3fn",
+                "float8_e4m3fn": "float8_e4m3fn",
+                "f8e5m2": "float8_e5m2", "e5m2": "float8_e5m2", "float8_e5m2": "float8_e5m2",
+            }
+            return aliases.get(t, t)
+
+        t = _normalize_dtype_token(tok)
+        # Guard against builds that don’t have float8
+        mapping = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        if hasattr(torch, "float8_e4m3fn"):
+            mapping["float8_e4m3fn"] = torch.float8_e4m3fn
+        if hasattr(torch, "float8_e5m2"):
+            mapping["float8_e5m2"] = torch.float8_e5m2
+        if t not in mapping:
+            raise ValueError(f"Unsupported dtype token: {tok}")
+        return mapping[t]
+
+    def _parse_cast_target(self, cast_target) -> list[tuple[torch.dtype, torch.dtype]]:
+        """
+        Accepts: 'f32 f16' or 'f32 f16, bf16 f16'
+        Returns list of (from_dtype, to_dtype) pairs.
+        """
         if not cast_target:
+            return []
+        if isinstance(cast_target, (list, tuple)) and cast_target and isinstance(cast_target[0], (list, tuple)):
+            parts = cast_target
+        else:
+            parts = []
+            for chunk in str(cast_target).split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                toks = chunk.split()
+                if len(toks) != 2:
+                    raise ValueError(f"Bad cast_target chunk: {chunk}")
+                parts.append((toks[0], toks[1]))
+
+        pairs = [(self._token_to_torch_dtype(src), self._token_to_torch_dtype(dst)) for src, dst in parts]
+        return pairs
+
+    def precast_all_layers(self, cpu_swappable_layers, layers, cast_target=None):
+        """
+        Cast only tensors matching the requested source dtype(s) to the target dtype(s).
+        - Parameters: considered for casting.
+        - Buffers: only floating-point buffers; keep BN running stats in fp32.
+        - Owner-aware writes; free old tensors immediately to limit peaks.
+        """
+        pairs = self._parse_cast_target(cast_target)
+        if not pairs:
             print("  No cast_target specified, skipping precasting")
             return
 
         print(" Pre-casting layer dtypes (one-time setup)...")
         casted_layers = 0
+        casts_done_params = 0
+        casts_done_buffers = 0
 
         for i, layer in enumerate(layers):
-            if i in cpu_swappable_layers:  # Only cast swappable layers
-                layer_casted = False
+            if i not in cpu_swappable_layers:
+                continue
 
-                for name, param in layer.named_parameters():
-                    # Use your existing function but stay on current device
-                    new_param = self.cast_to_dtype(param, param.device, cast_target)  # Keep on same device
-                    if new_param.dtype != param.dtype:
-                        # param.data = new_param.data
-                        with torch.inference_mode(False), torch.no_grad():
-                            setattr(layer, name, nn.Parameter(new_param.detach(), requires_grad=False))
-                        layer_casted = True
+            layer_casted = False
 
-                if layer_casted:
-                    casted_layers += 1
+            # --- Parameters ---
+            for name, param in layer.named_parameters(recurse=True):
+                if param is None or not torch.is_floating_point(param):
+                    continue
+                # Match the first mapping whose 'from' dtype equals current dtype
+                to_dtype = None
+                for src_dt, dst_dt in pairs:
+                    if param.dtype == src_dt:
+                        to_dtype = dst_dt
+                        break
+                if to_dtype is None:
+                    continue
 
-        print(f"✓ Pre-casted {casted_layers} layers using existing cast_to_dtype function")
+                # Safety: don’t cast to float8 here unless your kernels support it for these tensors
+                if to_dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+                    # Skip silently or log if verbose
+                    continue
+
+                new_param = param.to(dtype=to_dtype, device=param.device)
+                if new_param.dtype != param.dtype:
+                    with torch.inference_mode(False), torch.no_grad():
+                        owner, leaf = _owner_and_key(layer, name)
+                        old = owner._parameters.get(leaf, None)
+                        owner._parameters[leaf] = nn.Parameter(new_param.detach(), requires_grad=False)
+                        if old is not None:
+                            del old
+                    layer_casted = True
+                    casts_done_params += 1
+
+            # --- Buffers (float buffers only; keep BN stats in fp32) ---
+            for bname, buf in layer.named_buffers(recurse=True):
+                if buf is None or not torch.is_floating_point(buf):
+                    continue
+                # keep batchnorm running stats in fp32
+                if bname.endswith("running_mean") or bname.endswith("running_var"):
+                    continue
+
+                to_dtype = None
+                for src_dt, dst_dt in pairs:
+                    if buf.dtype == src_dt:
+                        to_dtype = dst_dt
+                        break
+                if to_dtype is None:
+                    continue
+                if to_dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
+                    continue
+
+                new_buf = buf.to(dtype=to_dtype, device=buf.device)
+                if new_buf.dtype != buf.dtype:
+                    with torch.inference_mode(False), torch.no_grad():
+                        owner, leaf = _owner_and_key(layer, bname)
+                        oldb = owner._buffers.get(leaf, None)
+                        if leaf in owner._buffers:
+                            owner._buffers[leaf] = new_buf.detach()
+                        else:
+                            owner.register_buffer(leaf, new_buf.detach(), persistent=True)
+                        if oldb is not None:
+                            del oldb
+                    layer_casted = True
+                    casts_done_buffers += 1
+
+            if layer_casted:
+                casted_layers += 1
+
+        print(f"✓ Pre-casted {casted_layers} layers "
+              f"(params changed: {casts_done_params}, buffers changed: {casts_done_buffers})")
 
 
 # =============================================================================
@@ -1750,102 +2077,101 @@ def print_memory_optimization_analysis(layers, args):
     # ========================================================================
     # MEMORY BREAKDOWN
     # ========================================================================
-    if is_startup:
-        print("\n--- MEMORY BREAKDOWN ---")
+    # if is_startup:
+    #     print("\n--- MEMORY BREAKDOWN ---")
+    #
+    #     if torch.cuda.is_available():
+    #         # Get actual memory state
+    #         stats = torch.cuda.memory_stats(0)
+    #         mem_free_cuda, _ = torch.cuda.mem_get_info(0)
+    #         mem_free_torch = stats['reserved_bytes.all.current'] - stats['active_bytes.all.current']
+    #         total_free = mem_free_cuda + mem_free_torch
+    #
+    #         device = comfy.model_management.get_torch_device()
+    #         total_free = comfy.model_management.get_free_memory(device)
+    #
+    #         # reserved_memory = comfy.model_management.extra_reserved_memory()  # OS/driver overhead
+    #         inference_memory = comfy.model_management.minimum_inference_memory()  # Base inference needs
+    #
+    #         # Calculate layer sizes
+    #         layer_sizes_bytes = []
+    #         for i, layer in enumerate(layers):
+    #             size_bytes = sum(p.numel() * p.element_size() for p in layer.parameters())
+    #             layer_sizes_bytes.append(size_bytes)
+    #
+    #         # Calculate swapping overhead
+    #         gpu_layers = gpu_resident_layers.copy()
+    #         swappable_layers = cpu_swappable_layers.copy()
+    #
+    #         swapping_overhead = 0
+    #         prefetch_overhead = 0
+    #         threading_overhead = 0
+    #         max_swappable_size = 0
+    #         if len(swappable_layers) > 0:
+    #             max_swappable_size = max(layer_sizes_bytes[i] for i in swappable_layers)
+    #             prefetch_overhead = (args.prefetch+1) * max_swappable_size * 1.25
+    #             threading_overhead = prefetch_overhead * 2
+    #
+    #         if args.cpu_threading:
+    #             swapping_overhead = prefetch_overhead + threading_overhead
+    #         else:
+    #             swapping_overhead = prefetch_overhead
+    #
+    #         # Calculate available memory step by step
+    #         after_inference = total_free - inference_memory
+    #         after_sampling = after_inference
+    #         available_for_layers = max(0, after_sampling - swapping_overhead)
+    #
+    #         print(f"MEMORY CALCULATION:")
+    #         print(f"  Total free memory: {total_free / 1024 ** 3:.2f} GB")
+    #         # print(f"  Reserved (OS/driver): {reserved_memory / 1024 ** 3:.2f} GB")
+    #         print(f"  Minus inference overhead: -{inference_memory / 1024 ** 3:.2f} GB = {after_inference / 1024 ** 3:.2f} GB")
+    #         print(f"  Minus swapping overhead: -{swapping_overhead / 1024 ** 3:.2f} GB = {available_for_layers / 1024 ** 3:.2f} GB")
+    #         # layers_min = calculate_auto_gpu_layers(layers, args)
+    #         if max_swappable_size > 0:
+    #             print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.1):.1f} Layers with prefetch=0")
+    #         # print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {len(layers_min)} Layers for current settings")
+    #
+    #
+    #         # Current allocation
+    #         gpu_memory_used = sum(layer_sizes_bytes[i] for i in gpu_layers) if gpu_layers else 0
+    #         unused_memory = available_for_layers - gpu_memory_used
+    #
+    #         print(f"\nCURRENT MEMORY ALLOCATION:")
+    #         print(f"  GPU layers: {len(gpu_layers)}/{len(layers)} (indices: {sorted(list(gpu_layers))})")
+    #         print(f"  Memory Used for Layers: {gpu_memory_used / 1024 ** 3:.2f} GB")
+    #         print(f"  Memory left for more layers: {available_for_layers / 1024 ** 3:.2f} GB")
+    #
+    #         print()
+    #     else:
+    #         available_for_layers = 0
+    #         gpu_memory_used = 0
+    #         unused_memory = 0
+    #         swapping_overhead = 0
 
-        if torch.cuda.is_available():
-            # Get actual memory state
-            stats = torch.cuda.memory_stats(0)
-            mem_free_cuda, _ = torch.cuda.mem_get_info(0)
-            mem_free_torch = stats['reserved_bytes.all.current'] - stats['active_bytes.all.current']
-            total_free = mem_free_cuda + mem_free_torch
-
-            device = comfy.model_management.get_torch_device()
-            total_free = comfy.model_management.get_free_memory(device)
-
-            # reserved_memory = comfy.model_management.extra_reserved_memory()  # OS/driver overhead
-            inference_memory = comfy.model_management.minimum_inference_memory()  # Base inference needs
-
-            # Calculate layer sizes
-            layer_sizes_bytes = []
-            for i, layer in enumerate(layers):
-                size_bytes = sum(p.numel() * p.element_size() for p in layer.parameters())
-                layer_sizes_bytes.append(size_bytes)
-
-            # Calculate swapping overhead
-            gpu_layers = gpu_resident_layers.copy()
-            swappable_layers = cpu_swappable_layers.copy()
-
-            swapping_overhead = 0
-            prefetch_overhead = 0
-            threading_overhead = 0
-            max_swappable_size = 0
-            if len(swappable_layers) > 0:
-                max_swappable_size = max(layer_sizes_bytes[i] for i in swappable_layers)
-                prefetch_overhead = (args.prefetch+1) * max_swappable_size * 1.25
-                threading_overhead = prefetch_overhead * 2
-
-            if args.cpu_threading:
-                swapping_overhead = prefetch_overhead + threading_overhead
-            else:
-                swapping_overhead = prefetch_overhead
-
-            # Calculate available memory step by step
-            after_inference = total_free - inference_memory
-            after_sampling = after_inference
-            available_for_layers = max(0, after_sampling - swapping_overhead)
-
-            print(f"MEMORY CALCULATION:")
-            print(f"  Total free memory: {total_free / 1024 ** 3:.2f} GB")
-            # print(f"  Reserved (OS/driver): {reserved_memory / 1024 ** 3:.2f} GB")
-            print(f"  Minus inference overhead: -{inference_memory / 1024 ** 3:.2f} GB = {after_inference / 1024 ** 3:.2f} GB")
-            print(f"  Minus swapping overhead: -{swapping_overhead / 1024 ** 3:.2f} GB = {available_for_layers / 1024 ** 3:.2f} GB")
-            # layers_min = calculate_auto_gpu_layers(layers, args)
-            if max_swappable_size > 0:
-                print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {(available_for_layers/ 1024 ** 3) / ((max_swappable_size/ 1024 ** 3) * 2.1):.1f} Layers with prefetch=0")
-            # print(f"  RECOMMENDED AMOUNT OF STARTING LAYERS: {len(layers_min)} Layers for current settings")
-
-
-            # Current allocation
-            gpu_memory_used = sum(layer_sizes_bytes[i] for i in gpu_layers) if gpu_layers else 0
-            unused_memory = available_for_layers - gpu_memory_used
-
-            print(f"\nCURRENT MEMORY ALLOCATION:")
-            print(f"  GPU layers: {len(gpu_layers)}/{len(layers)} (indices: {sorted(list(gpu_layers))})")
-            print(f"  Memory Used for Layers: {gpu_memory_used / 1024 ** 3:.2f} GB")
-            print(f"  Memory left for more layers: {available_for_layers / 1024 ** 3:.2f} GB")
-
-            print()
-        else:
-            available_for_layers = 0
-            gpu_memory_used = 0
-            unused_memory = 0
-            swapping_overhead = 0
-
-    else:
-        # ====================================================================
-        # STEP UPDATES (only during steps)
-        # ====================================================================
-        print("\n--- CURRENT GPU MEMORY ---")
-
-        if torch.cuda.is_available():
-            free_vram, _ = torch.cuda.mem_get_info(0)
-            allocated_memory = torch.cuda.memory_allocated(0)
-            reserved_memory = torch.cuda.memory_reserved(0)
-
-            print(f"  Free VRAM: {free_vram / 1024 ** 3:.2f} GB")
-            print(f"  Allocated: {allocated_memory / 1024 ** 3:.2f} GB")
-            print(f"  Reserved: {reserved_memory / 1024 ** 3:.2f} GB")
-
-        print(f"\n--- SYSTEM MEMORY: ---")
-        cpu_mem = psutil.virtual_memory()
-        print(f"  Total RAM: {cpu_mem.total / 1024 ** 3:.2f} GB")
-        print(f"  Available RAM: {cpu_mem.available / 1024 ** 3:.2f} GB")
+    # else:
+    #     # ====================================================================
+    #     # STEP UPDATES (only during steps)
+    #     # ====================================================================
+    #     print("\n--- CURRENT GPU MEMORY ---")
+    #
+    #     if torch.cuda.is_available():
+    #         free_vram, _ = torch.cuda.mem_get_info(0)
+    #         allocated_memory = torch.cuda.memory_allocated(0)
+    #         reserved_memory = torch.cuda.memory_reserved(0)
+    #
+    #         print(f"  Free VRAM: {free_vram / 1024 ** 3:.2f} GB")
+    #         print(f"  Allocated: {allocated_memory / 1024 ** 3:.2f} GB")
+    #         print(f"  Reserved: {reserved_memory / 1024 ** 3:.2f} GB")
+    #
+    #     print(f"\n--- SYSTEM MEMORY: ---")
+    #     cpu_mem = psutil.virtual_memory()
+    #     print(f"  Total RAM: {cpu_mem.total / 1024 ** 3:.2f} GB")
+    #     print(f"  Available RAM: {cpu_mem.available / 1024 ** 3:.2f} GB")
 
     return {
-        'available_memory_gb': available_for_layers / 1024 ** 3 if available_for_layers else 0,
-        'unused_memory_gb': unused_memory / 1024 ** 3 if available_for_layers else 0,
-        'gpu_layers': list(gpu_layers) if available_for_layers else [],
-        'swapping_overhead_gb': swapping_overhead / 1024 ** 3 if available_for_layers else 0
+        # 'available_memory_gb': available_for_layers / 1024 ** 3 if available_for_layers else 0,
+        # 'unused_memory_gb': unused_memory / 1024 ** 3 if available_for_layers else 0,
+        # 'gpu_layers': list(gpu_layers) if available_for_layers else [],
+        # 'swapping_overhead_gb': swapping_overhead / 1024 ** 3 if available_for_layers else 0
     }
-
