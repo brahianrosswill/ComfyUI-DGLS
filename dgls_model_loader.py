@@ -180,7 +180,7 @@ class DGLSModelLoader:
                 "verbose": ("BOOLEAN", {"default": False}),
             },
             "optional": {"nuke_all_caches": ("BOOLEAN", {"default": False, "tooltip": "CAUTION: Aggressive Clear all ComfyUI caches"}),
-                "custom_ckpt_path": ("STRING", {"default": ""}),
+                # "custom_ckpt_path": ("STRING", {"default": ""}),
             }
         }
 
@@ -190,11 +190,9 @@ class DGLSModelLoader:
     CATEGORY = "loaders"
     TITLE = "DGLS Model Loader"
 
-    def load_dgls_model(self, model_name, model_type, cast_dtype,  verbose, clear_model_cache=False, nuke_all_caches=False, custom_ckpt_path="", override_model_type="auto"):
-
+    def load_dgls_model(self, model_name, model_type, cast_dtype,  verbose, clear_model_cache, nuke_all_caches=False, custom_ckpt_path="", override_model_type="auto"):
 
         self.verbose = verbose
-
         # Cache clearing logic
         if nuke_all_caches:
             self.nuke_all_caches()
@@ -297,8 +295,7 @@ class DGLSModelLoader:
                         comfy.utils.set_attr_param(
                             model_patcher.model,
                             name,
-                            param.data.clone()
-                        )
+                            param.data.clone())
         return model_patcher
 
     def normalize_inference_model_patcher(self, model_patcher, verbose=False, attr_names=None):
