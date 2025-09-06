@@ -562,10 +562,10 @@ def calculate_auto_gpu_layers(layers, args):
         overhead = max_layer_size * 1.1 * (args.prefetch + 1)
 
         if args.cpu_threading:
-            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.25 * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.1 * (args.prefetch + 1)
+            overhead += max_layer_size * 0.25 * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
@@ -1661,16 +1661,17 @@ class DynamicSwappingLoader:
             except Exception:
                 pass
 
-        try:
-            model.add_callback(CallbacksMP.ON_DETACH, _release_pinned)
-            print("ON_DETACH worked")
-        except Exception:
+        if args.pin_memory:
             try:
-                model.add_callback(CallbacksMP.ON_CLEANUP, _release_pinned)
-                print("ON_CLEANUP worked")
+                model.add_callback(CallbacksMP.ON_DETACH, _release_pinned)
+                print("ON_DETACH worked")
             except Exception:
-                print(f"[PINNING] cleanup registration failed: {e}")
-        gc.collect()
+                try:
+                    model.add_callback(CallbacksMP.ON_CLEANUP, _release_pinned)
+                    print("ON_CLEANUP worked")
+                except Exception:
+                    print(f"[PINNING] cleanup registration failed: {e}")
+            gc.collect()
 
         if args.verbose:
             print("✓ Dynamic swapping successfully integrated with ComfyUI")
