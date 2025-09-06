@@ -1,12 +1,10 @@
-# DGLS — Dynamic GPU Layer Swapping for ComfyUI
+## DGLS — Dynamic GPU Layer Swapping for ComfyUI
 
-Run larger diffusion models on limited VRAM by **smartly swapping layers between CPU and GPU** during inference. DGLS ships as two ComfyUI nodes: a **Model Loader** that extracts compute layers and a **Dynamic Swapping Loader** that manages on‑the‑fly layer placement, prefetching, and (optionally) copy/compute overlap.
+Smart dynamic layer swapping between GPU and CPU for optimal inference performance with target casting, and copy-compute overlap optimization. Enables running much larger models on limited VRAM setups.
+
 ---
-## NOTE: 
-
+## NOTE:
 This is still under development. I am actively bug testing this atm. It's fully working on RTX 2060 and 2080ti. I havent promoted this or written about it due to some tests I want to carry out. I am currently getting between 10-30% speed improvement compared to official node.
-
----
 Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
 ---
 
@@ -27,7 +25,7 @@ Currently only working with diffusion models. So any workflow with 'Load Diffusi
 
 * **ComfyUI** (CUDA‑enabled PyTorch).
 * **GPU:** Any CUDA‑capable GPU.
-* **System RAM:** 32GB+ recommended if you plan to enable overlap/pinning. 16GB can work
+* **System RAM:** 32GB+ recommended if you plan to enable overlap/pinning. 16GB can work, 64GB+ is best.
 
 ---
 
