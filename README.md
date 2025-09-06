@@ -8,7 +8,7 @@ This is still under development. I am actively bug testing this atm. It's fully 
 Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
 ---
 
-## Highlights
+## Features
 
 * **Drop‑in ComfyUI integration.** Adds two nodes under the **loaders** category: `DGLS Model Loader` and `Dynamic Swapping Loader`.
 * **Architecture‑aware layer extraction.** Handles Cosmos, FLUX, WAN 2.1/2.2, HunyuanVideo, SD3‑style stacks, and generic transformer layouts.
@@ -17,7 +17,6 @@ Currently only working with diffusion models. So any workflow with 'Load Diffusi
 * **Predictive prefetch.** Chooses the next `prefetch` layers in ring order; optional CUDA streams and a conservative CPU helper thread can overlap H2D copies with compute.
 * **CUDA Streams**: Uses CUDA streams to overlap memory transfers with computation
 * **Target Casting**: Precision casting for specific Dtypes in  mixed layer models
-
 
 ---
 
