@@ -5,7 +5,7 @@ Smart dynamic layer swapping between GPU and CPU for optimal inference performan
 ---
 ## NOTE:
 This is still under development. I am actively bug testing this atm. It's fully working on RTX 2060 and 2080ti. I havent promoted this or written about it due to some tests I want to carry out. I am currently getting between 10-30% speed improvement compared to official node.
-Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
+
 ---
 
 ## Features
@@ -25,6 +25,7 @@ Currently only working with diffusion models. So any workflow with 'Load Diffusi
 * **ComfyUI** (CUDA‑enabled PyTorch).
 * **GPU:** Any CUDA‑capable GPU.
 * **System RAM:** 32GB+ recommended if you plan to enable overlap/pinning. 16GB can work, 64GB+ is best.
+* **Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
 
 ---
 
