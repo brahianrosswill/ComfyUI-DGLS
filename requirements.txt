@@ -1,0 +1,8 @@
+# Core PyTorch ecosystem
+torch>=2.6.0
+xformers>=0.0.32
+safetensors>=0.3.0
+
+# Memory management and system utilities
+psutil>=5.9.0
+bitsandbytes>=0.41.0
