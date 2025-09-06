@@ -1,38 +1,37 @@
-# ComfyUI - DGLS (Dynamic GPU Layer Swapping) 
+# DGLS — Dynamic GPU Layer Swapping for ComfyUI
 
-Smart dynamic layer swapping between GPU and CPU for optimal inference performance with comprehensive mixed precision handling and copy-compute overlap optimization. Enables running much larger models on limited VRAM setups.
+Run larger diffusion models on limited VRAM by **smartly swapping layers between CPU and GPU** during inference. DGLS ships as two ComfyUI nodes: a **Model Loader** that extracts compute layers and a **Dynamic Swapping Loader** that manages on‑the‑fly layer placement, prefetching, and (optionally) copy/compute overlap.
+---
+## NOTE: 
 
-NOTE: I am am actively bug testing this atm. The code is working, however I havent promoted this or written about it due to some tests I want to carry out. README is for an old version adn will be updated shortly
+This is still under development. I am actively bug testing this atm. It's fully working on RTX 2060 and 2080ti. I havent promoted this or written about it due to some tests I want to carry out. I am currently getting between 10-30% speed improvement compared to official node.
 
-Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' offical node should be fine with this swapped for it. OmniGen not working atm. 
+---
+Currently only working with diffusion models. So any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
+---
 
-## Features
+## Highlights
 
-* **Inference Optimized**: Designed specifically for ComfyUI diffusion model inference
-* **Mixed Precision Support**: Handles multiple dtypes and precision casting
-* **Threading and Copy-Compute Overlap**: Background thread management with overlapped memory transfers
-* **Predictive Prefetching**: Intelligently predicts and preloads layers before they're needed
-* **Packed Transfers**: Optimizes large layer transfers using contiguous memory packing
+* **Drop‑in ComfyUI integration.** Adds two nodes under the **loaders** category: `DGLS Model Loader` and `Dynamic Swapping Loader`.
+* **Architecture‑aware layer extraction.** Handles Cosmos, FLUX, WAN 2.1/2.2, HunyuanVideo, SD3‑style stacks, and generic transformer layouts.
+* **Buffers‑on‑GPU / params‑on‑CPU design.** Small buffers remain on GPU; master parameter tensors live on CPU and are **rebound** to GPU storage just‑in‑time per layer (via an optimized `_reassign_param`), avoiding redundant cloning.
+* **Auto or manual GPU residency.** Leave it on **auto** (default) or pass an explicit comma‑separated `gpu_layer_indices` to pin chosen layers on GPU.
+* **Predictive prefetch.** Chooses the next `prefetch` layers in ring order; optional CUDA streams and a conservative CPU helper thread can overlap H2D copies with compute.
 * **CUDA Streams**: Uses CUDA streams to overlap memory transfers with computation
-* **Model Compatibility**: Supports Cosmos, Flux, Wan2.1, Wan2.2, HunyuanVideo, and generic transformer blocks.
+* **Target Casting**: Precision casting for specific Dtypes in  mixed layer models
 
-This memory management system maintains inference performance while dramatically reducing VRAM requirements through intelligent layer orchestration.
 
-## Performance
+---
 
-Achieved a 30% reduction in speed compared to other offloading techniques in comfy. 
+## Requirements
 
-## System Requirements
+* **ComfyUI** (CUDA‑enabled PyTorch).
+* **GPU:** Any CUDA‑capable GPU.
+* **System RAM:** 32GB+ recommended if you plan to enable overlap/pinning. 16GB can work
 
-**GPU Compatibility**: CUDA-capable GPUs, tested on RTX 2060 and RTX 2080 Ti
+---
 
-**Memory Requirements**:
-- **RAM**: 16GB minimum, 32GB recommended for large models
-- **RAM Speed**: 3200MHz+ recommended for optimal transfer speeds
-- **VRAM**: 6GB+ (enables inference of models that normally require 16GB+)
-
-## Installation
-### ComfyUI Custom Nodes Installation
+## Installation (Custom Nodes)
 
 1. Navigate to your ComfyUI custom nodes directory:
 ```bash
@@ -47,216 +46,129 @@ git clone https://github.com/obisin/dgls-comfyui
 
 3. Restart ComfyUI - the nodes should appear in the loaders category
 
-### Required Files
-- `dynamic_swapping_loader.py` - Main swapping logic and ComfyUI node
-- `dgls_model_loader.py` - Model loader with layer extraction
+## REMEMBER TO INSTALL THE REQUIREMENTS.TXT FOR BEST PERFORMANCE
 
-## How It Works
+---
 
-DGLS implements intelligent layer management during inference by maintaining a **sliding window** of active layers on GPU while keeping others on CPU.
+## Nodes & Parameters
 
-### Inference Process
-```
-Sampling Step:  [GPU: layers 0,1,2,20,21] [CPU: layers 3,4,5,...,19]
-                ↓ Permanent residents + sliding window
-Forward Pass:   [GPU: layers 0,1,2,3,4] [CPU: layers 5,6,...,19,20,21]
-                ↓ Compute layer 2, prefetch layer 4
-Next Layer:     [GPU: layers 0,1,3,4,5] [CPU: layers 2,6,7,...,19,20,21]
-                ↓ Evict layer 2, compute layer 3, prefetch layer 5
-```
+### 1) DGLS Model Loader
 
-**Key Principles**:
-- **Permanent Residents**: First/last layers stay on GPU for stability
-- **Sliding Window**: Middle layers swap dynamically based on computation needs
-- **Prefetching**: Next layers loaded while current layer computes
-- **Background **: Synchronous transfers overlap with computation
+**Title:** `DGLS Model Loader`
+**Returns:** `(MODEL, LAYERS)` for the next node.
+**Category:** `loaders`
 
-## Node Usage
+**Inputs (required):**
 
-### DGLS Model Loader Node
+* `model_name` — selectable from Comfy paths (`unet` + `diffusion_models`).
+* `model_type` — one of: `default | hunyuan | unet` (use `default` unless hunyuan).
+* `cast_dtype` — one of: `default | fp32 | fp16 | bf16 | fp8_e4m3fn | fp8_e4m3fn_fast | fp8_e5m2` (applied at load time).
+* `clear_model_cache` — boolean; force reload from disk, bypassing Comfy’s model cache.
+* `verbose` — boolean; prints detection/dtype/extraction info (slower when enabled).
 
-**Inputs**:
-- `model_name`: Select from available diffusion models
-- `model_type`: Choose model architecture type (if model not on list pick default)
-- `cast_dtype`: Target dtype for model weights
-- `verbose`: Enable detailed logging
+**Inputs (optional):**
 
-**Outputs**:
-- `model`: Loaded ComfyUI model
-- `layers`: Extracted layers for swapping
+* `nuke_all_caches` — boolean; CAUTION: aggressively clears assorted Comfy caches (can force other nodes to reload).
 
-### DGLS Swapping Loader Node
+**What it does**
 
-**Required Inputs**:
-- `model`: Model from DGLS Model Loader
-- `layers`: Layers from DGLS Model Loader
-- `initial_gpu_layers`: Number of initial layers to keep on GPU (1-10)
-- `final_gpu_layers`: Number of final layers to keep on GPU (1-10)
-- `prefetch`: Number of layers to prefetch ahead (0-4)
+* Loads the model and extracts a consistent **LAYERS** sequence across supported architectures.
 
-**Optional Performance Settings**:
-- `threading`: Enable background threading for better overlap (May not work with all models or systems)
-- `cuda_streams`: Enable CUDA streams (requires more VRAM)
-- `batch_move`: Move multiple layers simultaneously
-- `selective_packing`: Size threshold for packed transfers (MB)
-- `event_sync`: Use CUDA events for better synchronization
-- `compile`: Enable torch.compile for permanent GPU layers
+---
 
-**Advanced Options**:
-- `gpu_layer_indices`: Specify exact layers to keep on GPU (comma-separated)
-- `verbose`: Enable detailed timing and transfer information
+### 2) Dynamic Swapping Loader
 
-## Configuration Examples
+**Title:** `Dynamic Swapping Loader`
+**Input:** `(MODEL, LAYERS)` from the previous node.
+**Returns:** `(MODEL)` with smart swapping enabled.
+**Category:** `loaders`
 
-### Conservative Setup (6GB VRAM)
-```
-initial_gpu_layers: 2
-final_gpu_layers: 2
-prefetch: 1
-threading: False
-event_sync: True
-```
+**Inputs (required):**
 
-### Balanced Setup (8-12GB VRAM)
-```
-initial_gpu_layers: 3
-final_gpu_layers: 3
-prefetch: 2
-threading: True
-batch_move: True
-selective_packing: 64
-event_sync: True
-```
+* `prefetch` *(int, default 1, min 0, max 100)* — number of future layers to stage.
+* `cpu_threading` *(bool, default False)* — background CPU helper for async staging (can help on some systems; may add overhead on others).
+* `cuda_streams` *(bool, default False)* — enable CUDA streams/events for copy–compute overlap (needs a little VRAM headroom).
+* `verbose` *(bool, default True)* — print layer sizes, timings, and decisions. Good for debugging and getting optimal settings when manually choosing layers
 
-### High Performance (16GB+ VRAM)
-```
-initial_gpu_layers: 5+
-final_gpu_layers: 5+
-prefetch: 3+
-threading: True
-cuda_streams: True
-batch_move: True
-selective_packing: 128
-compile: True
-event_sync: True
-```
+**Inputs (optional):**
 
-## Workflow Integration
+* `gpu_layer_indices` *(string)* — comma‑separated layer indices to keep permanently on GPU, e.g. `0,1,2,28,29`. When set, this **overrides** auto selection. Best for models with some layers having difficulty swapping.
+* `cast_target` *(string)* — one‑time recast mapping like `"f32 f16"` or multiple pairs: `"bf16 f16, f32 bf16"`. Float8/4‑bit require kernel support and are applied conservatively.
 
-Works in place of the **Load Diffusion Model** official comfy node.
+**How it swaps (overview)**
 
-### Basic Workflow
-1. **DGLS Model Loader** → Load your diffusion model
-2. **Dynamic Swapping Loader** → Apply swapping configuration
-3. **Connect to samplers** → Use swapping-enabled model for inference
+1. **Setup:** identify swappable layers; keep module **buffers** on GPU; maintain CPU **master** parameters.
+2. **Per‑layer compute:** for layer `k`, compute the **needed set** = `{k, k+1…k+prefetch}` in a **ring order** over swappables.
+3. **Evict & stage:** unneeded layers rebind back to CPU masters; needed layers copy CPU→GPU and `_reassign_param` binds the GPU storage (no extra clones when shapes/dtypes/devices already match).
+4. **(Optional) overlap:** CUDA streams + events coordinate; an optional CPU thread can prepare upcoming transfers.
 
-## Arguments Reference
+This design minimizes VRAM while keeping hot state local and avoiding parameter churn.
 
-NOTE: All settings can be stacked together!
+---
 
-### Core Settings
+## Quick Start
 
-**`initial_gpu_layers` / `final_gpu_layers`**
-- **Purpose**: Number of layers to keep permanently on GPU
-- **Recommendation**: Start with 2-3 each, increase if you have more VRAM
+**Minimal (safe defaults)**
 
-**`prefetch`**
-- **Purpose**: Number of layers to preload ahead of current computation
-- **Recommendation**: 1-2 for most setups, higher with more VRAM
+1. `DGLS Model Loader` → choose your model → `verbose: off` (optional).
+2. `Dynamic Swapping Loader`
 
-**`gpu_layer_indices`**
-- **Format**: Comma-separated numbers (e.g., "0,1,2,18,19,20")
-- **Purpose**: Precise control over GPU-resident layers
-- **Use**: Overrides initial/final settings when specified
+   * `prefetch: 1`
+   * `cpu_threading: off`
+   * `cuda_streams: off`
+   * leave `gpu_layer_indices` empty (auto GPU residency)
+3. Connect to your sampler / Apply Model node and run.
 
-### Performance Optimization
+**Balanced (mid‑VRAM)**
 
-**`threading`**
-- **Purpose**: Background thread for automatic layer management
-- **Benefit**: Better overlap of transfers with computation
-- **Note**: If you're using a smaller model or one with a fast compute per layer, threading may be counter productive as the swap will lag behind the fast compute. Instead increase resident GPU layers and prefetch
-- **Note**: May cause instability in some systems
+* Try `prefetch: 2`, enable `cuda_streams` if you have headroom. Keep `cpu_threading` off unless profiling shows benefit.
+* If you know the bottlenecks (e.g., earliest/latest blocks), set `gpu_layer_indices` explicitly.
+* For some model prefecth 0 might be preferable
 
-**`cuda_streams`**
-- **Purpose**: CUDA streams for copy-compute overlap
-- **Requirement**: Additional VRAM for stream buffers
-- **Benefit**: Maximum performance when VRAM allows
-- **Note**: May not work with all models, Flux can sometimes have issues
+**Manual GPU residency**
 
-**`batch_move`**
-- **Purpose**: Move multiple layers simultaneously
-- **Benefit**: Better for GPUs with higher bandwidth
+* Provide `gpu_layer_indices` like `0,1,2,28,29` to pin those layers on GPU; others will swap dynamically.
 
-**`selective_packing`**
-- **Purpose**: Pack large layers for optimized transfers
+---
 
-**`event_sync`**
-- **Purpose**: Use CUDA events instead of basic synchronization
-- **Benefit**: Better performance in most cases
-- **Recommendation**: Enable unless experiencing issues
+## Casting & Precision (optional)
 
-**`compile`**
-- **Purpose**: torch.compile optimization for permanent GPU layers
-- **Requirement**: PyTorch 2.0+
-- **Benefit**: Additional speedup for resident layers
+* Use `cast_target` to convert specific *source → target* dtypes at start‑up, e.g.:
+
+  * `"f32 f16"` (downcast FP32 → FP16)
+  * `"bf16 f16, f32 bf16"` (multiple rules)
+* Float8 and 4‑bit (`nf4`/`fp4`) paths are guarded: they’re only applied if kernels support them; otherwise the safer fallback (e.g., `bf16`) is used.
+* For global model dtype at load time, use the Model Loader’s `cast_dtype` (separate from `cast_target`).
+
+---
+
+## Tips & Tuning
+
+* **Auto vs manual GPU layers:** leaving `gpu_layer_indices` empty uses DGLS auto‑selection based on availability and layer sizes. Explicit indices take priority.
+* **Prefetch:** start with `1`. Increase only if you see stalls and have spare VRAM. The ring order avoids wasteful wraps.
+* **Overlap options:** try **CUDA streams** first if you have headroom. CPU threading is conservative (1 worker) and helps mainly where trasnfer latency dominates.
+* **Verbose diagnostics:** enable `verbose` to print chosen residents, swappable indices, sizes (MB), and timing—useful for dialing in `prefetch` and residency.
+
+---
 
 ## Troubleshooting
 
-First try restarting Comfy after an error or OOM.
+* **“Cannot fit layer X on GPU.”** Reduce `gpu_layer_indices`, lower `prefetch`. The emergency path will attempt cleanup/re‑stage; persistent failure means lowering residency.
+* **Instability with overlap.** Turn off `cuda_streams` and `cpu_threading`; re‑run with `verbose` to inspect staging.
+* **Odd dtype/buffers.** Prefer conservative `cast_target` rules; keep batch‑norm‑like stats in fp32 (the loader handles common cases).
 
-### Memory Issues
+---
 
-**"CUDA out of memory" during startup**:
-- Reduce `initial_gpu_layers` and `final_gpu_layers` to 1
-- Disable `cuda_streams` or `selective_packing`
-- Use lower `prefetch` values
+## File Map
 
-### Performance Issues
+* `dgls_model_loader.py` — model loading, dtype at load, cache management, robust layer extraction, and tensor healing.
+* `dynamic_swapping_loader.py` — swapping engine, auto or explicit GPU residency, prefetch/overlap options, and the ComfyUI loader node.
 
-**Slow inference**:
-- Enable `threading` and `event_sync`
-- Increase `prefetch` if you have spare VRAM
-- Try `batch_move` for newer GPUs
+---
 
-**Low prefetch efficiency**:
-- Reduce `prefetch` value
-- Enable `threading` for background management
-- Check VRAM usage and reduce permanent layers
+## License
 
-### Stability Issues
+(see repository license file).
 
-**Crashes with threading**:
-- Disable `threading`
-- Use conservative `prefetch` values
-- Enable `verbose` to debug timing issues
+---
 
-**Device synchronization errors**:
-- Disable `cuda_streams`
-
-## Technical Details
-
-### Performance Optimizations
-- **Hot Path Functions**: Module-level functions with local variable binding
-- **Minimal Call Overhead**: Direct function calls without abstraction layers
-- **Factory Pattern**: Clean interfaces with fast execution
-- **Cache-Aware Design**: Efficient device state tracking
-
-### Memory Management
-- **Three-Tier Hierarchy**: GPU residents, sliding window, CPU storage
-- **Packed Transfers**: Contiguous memory for better PCIe utilization
-- **Event-Based Sync**: CUDA events for precise timing control
-
-## Limitations
-
-**Single GPU Only**: Designed for single GPU inference setups- Will not conflict if you set your vae or clip to another GPU for storage though.
-
-**ComfyUI Specific**: Optimized for ComfyUI's inference patterns and model structures
-
-**Model Architecture**: Some complex multi-branch models may need manual layer specification
-
-
-## Attribution & License
-
-**Dynamic Swapping Method**: Original research and implementation by **obisin**
-
-**MIT License** - See LICENSE file for full details
