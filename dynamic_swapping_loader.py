@@ -76,7 +76,7 @@ TOOLTIPS = {
     "cuda_streams": "Enable CUDA streams for copy-compute overlap (needs more VRAM)",
     "cpu_threading": "Enable CPU threading for async CPU transfers (May cause instability on some systems)",
     "cast_target": "Cast FROM dtype TO dtype at start-up (e.g., f32 bf16) choices=[f32, bf16, f16, f8_e4m3, f8_e5m2, nf4, fp4] WARNING: don’t cast to f8/fp4 here unless your kernels support it",
-    "verbose": "Enable verbose output with detailed timing and transfer information",
+    "verbose": "Enable verbose output with detailed timing and transfer information. This will slow down inference when on",
     "pin_memory": "Pin CPU memory for faster async GPU transfers (uses 2x CPU RAM for swappable layers)",
 
 }
@@ -390,6 +390,17 @@ def _owner_and_key(module: nn.Module, dotted: str):
     else:
         return module, dotted
 
+def _move_buffers_only(layer: nn.Module, device: torch.device | str):
+    """Move only buffers to device, keeping parameters on their current device"""
+    with torch.no_grad():
+        for bname, buf in layer.named_buffers(recurse=True):
+            if buf is None:
+                continue
+            new_b = buf.to(device, non_blocking=True)
+            owner, leaf = _owner_and_key(layer, bname)
+            # Replace in-place to drop old storage quickly
+            owner._buffers[leaf] = new_b if new_b.is_contiguous() else new_b.contiguous()
+
 def pin_cpu_memory(layer, idx):
     """Pin CPU tensors for faster CPU→GPU copies (still CPU)."""
     MIN_MB = int(getattr(args, 'pin_min_mb', 128))
@@ -443,7 +454,8 @@ def _prepare_swappable_layer(layer: nn.Module, idx: int, pin: bool):
         return
 
     # Buffers -> GPU (small), we will only swap params
-    layer.to(GPU_DEVICE)
+    # layer.to(GPU_DEVICE)
+    _move_buffers_only(layer, GPU_DEVICE)
 
     layer._cpu_master_data = {}    # { dotted_name: CPU tensor }
     layer._gpu_slots = {}          # { dotted_name: CUDA tensor } (allocated lazily per stage/evict)
@@ -468,11 +480,6 @@ def _prepare_swappable_layer(layer: nn.Module, idx: int, pin: bool):
     layer._dgls_swappable_ready = True
 
 
-# def _reassign_param(owner: nn.Module, leaf: str, tensor: torch.Tensor):
-#     # guarantees a fresh Parameter that has a version counter
-#     with torch.inference_mode(False), torch.no_grad():
-#         owner._parameters[leaf] = nn.Parameter(tensor.detach().contiguous(), requires_grad=False)
-
 def _reassign_param(owner: nn.Module, leaf: str, tensor: torch.Tensor):
     # fast-path: already bound to the same storage
     cur = owner._parameters.get(leaf, None)
@@ -482,14 +489,17 @@ def _reassign_param(owner: nn.Module, leaf: str, tensor: torch.Tensor):
         and cur.dtype == tensor.dtype
         and cur.device == tensor.device
         and cur.data_ptr() == tensor.data_ptr()):
-        return  # nothing to do
+        return  # nothing to do # already bound; no-op
 
-    # otherwise build a fresh Parameter with a version counter
     with torch.inference_mode(False), torch.no_grad():
+        old = owner._parameters.get(leaf, None)
         owner._parameters[leaf] = nn.Parameter(
             tensor if tensor.is_contiguous() else tensor.contiguous(),
             requires_grad=False
         )
+        if old is not None:
+            del old
+
 
 
 def stage_to_gpu(layer_idx):
@@ -506,7 +516,10 @@ def stage_to_gpu(layer_idx):
             gpu_t = layer._gpu_slots.get(pname)
             if (gpu_t is None or (not gpu_t.is_cuda)
                 or gpu_t.shape != cpu_master.shape or gpu_t.dtype != cpu_master.dtype):
-                gpu_t = cpu_master.to(GPU_DEVICE, copy=True, non_blocking=True).contiguous()
+                # gpu_t = cpu_master.to(GPU_DEVICE, copy=True, non_blocking=True).contiguous()
+                # layer._gpu_slots[pname] = gpu_t
+                gpu_t = torch.empty_like(cpu_master, device=GPU_DEVICE)
+                gpu_t.copy_(cpu_master, non_blocking=True)
                 layer._gpu_slots[pname] = gpu_t
             else:
                 gpu_t.copy_(cpu_master, non_blocking=True)
@@ -534,12 +547,14 @@ def rebind(layer_idx):
                 slots.pop(k, None)
 
 
-def calculate_auto_gpu_layers(layers, args):
+def calculate_auto_gpu_layers(layers, args, model_patcher=None):
     """Auto-select GPU layers allocation logic with safety mechanisms"""
 
-    layer_overhead_mult = 1.05
-
+    layer_overhead_mult = 1.1
+    overhead_ratio = 0.1
+    lora_mult = 1.5
     device = comfy.model_management.get_torch_device()
+    reserve_lora = getattr(args, 'using_lora', False)
 
     # Step 1: Cleanup existing models
     comfy.model_management.cleanup_models_gc()
@@ -569,7 +584,7 @@ def calculate_auto_gpu_layers(layers, args):
     else:
         min_ratio = 0.4
 
-    # Step 6: budget calculation
+    # Step 6: Budget calculation
     layer_memory_budget = max(
         128 * 1024 * 1024,
         (current_free_mem - minimum_memory_required),
@@ -578,9 +593,21 @@ def calculate_auto_gpu_layers(layers, args):
             current_free_mem - minimum_memory_required
         )
     )
+    # Get currently loaded memory and subtract it (device-aware)
+    loaded_memory = 0
+    for model in comfy.model_management.loaded_models():
+        try:
+            model_device = None
+            if hasattr(model, 'load_device'):
+                model_device = model.load_device
+            elif hasattr(model, 'model') and hasattr(model.model, 'device'):
+                model_device = model.model.device
 
-    # Get currently loaded memory and subtract it
-    loaded_memory = sum(model.loaded_size() for model in comfy.model_management.loaded_models())
+            if model_device == device:
+                loaded_memory += model.loaded_size()
+        except:
+            loaded_memory += model.loaded_size()
+
     layer_memory_budget = max(0.1, layer_memory_budget - loaded_memory)
 
     # Step 7: Calculate layer sizes and sort (largest first)
@@ -590,21 +617,40 @@ def calculate_auto_gpu_layers(layers, args):
         layer_allocation_data.append((layer_size, i))
 
     layer_allocation_data.sort(reverse=True, key=lambda x: x[0])
+    max_layer_size = 0
 
     # Step 8: Apply overhead from user settings
     if layer_allocation_data:
         max_layer_size = layer_allocation_data[0][0]
         overhead = max_layer_size * layer_overhead_mult * (args.prefetch + 1)
 
+        # if reserve_lora:
+        #     ratio = 0.33
+        # else:
+        #     ratio = 0.1
+
         if args.cpu_threading:
-            overhead += max_layer_size * 0.25 * (args.prefetch + 1)
+            overhead += max_layer_size * overhead_ratio * (args.prefetch + 1)
 
         if args.cuda_streams:
-            overhead += max_layer_size * 0.25 * (args.prefetch + 1)
+            overhead += max_layer_size * overhead_ratio * (args.prefetch + 1)
 
         layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - overhead)
 
-    # Step 9: Greedy allocation
+    # Step 9: Reserve VRAM for LoRA active patches
+    lora_buf = 0
+
+    if reserve_lora:
+        if args.verbose:
+            print("[DGLS] Active LoRA nodes - reserving memory")
+        lora_workspace_per_layer = max_layer_size * 0.05
+        lora_buf = max_layer_size * lora_mult #int(lora_workspace_per_layer * (args.prefetch + 1) * 1.1)
+        layer_memory_budget = max(128 * 1024 * 1024, layer_memory_budget - lora_buf)
+    else:
+        if args.verbose:
+            print("[DGLS] No LoRA nodes active - skipping LoRA memory reservation")
+
+    # Step 10: Greedy allocation
     allocated_memory = 0
     selected_gpu_layers = set()
 
@@ -615,13 +661,12 @@ def calculate_auto_gpu_layers(layers, args):
         else:
             break
 
-    # Step 10: Final validation
-    if allocated_memory > current_free_mem * 0.85:  # Additional safety check
+    # Step 11: Final validation
+    if allocated_memory > current_free_mem * 0.85:
         print("WARNING: High memory allocation detected, reducing selection")
-        # Remove smallest selected layers until under 85% of free memory
         selected_list = [(layer_allocation_data[i][0], layer_allocation_data[i][1]) for i in
                          range(len(layer_allocation_data)) if layer_allocation_data[i][1] in selected_gpu_layers]
-        selected_list.sort()  # Smallest first for removal
+        selected_list.sort()
 
         while allocated_memory > current_free_mem * 0.8 and selected_list:
             removed_size, removed_idx = selected_list.pop(0)
@@ -635,7 +680,6 @@ def calculate_auto_gpu_layers(layers, args):
         print(f"Final allocated: {allocated_memory / (1024 ** 2):.0f}MB")
 
     return selected_gpu_layers
-
 
 def calculate_needed_layers(layer_idx, prefetch):
     needed = set()
@@ -1146,7 +1190,9 @@ class DynamicSwappingLoader:
                 "cpu_threading": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cpu_threading"]}),
                 "cuda_streams": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["cuda_streams"]}),
                 # "pin_memory": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["pin_memory"]}),
-                "verbose": ("BOOLEAN", {"default": True, "tooltip": TOOLTIPS["verbose"]}),
+                "using_lora": ("BOOLEAN", {"default": True,"tooltip": "Reserve memory for LoRA patches during inference"}),
+
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": TOOLTIPS["verbose"]}),
             },
             "optional": {
                 "gpu_layer_indices": ("STRING", {"default": "", "tooltip": TOOLTIPS["gpu_layers"]}),
@@ -1162,7 +1208,7 @@ class DynamicSwappingLoader:
     TITLE = "Dynamic Swapping Loader"
 
     def load_model_with_swapping(self, model, layers, prefetch, verbose,  gpu_layer_indices="",
-                                 cast_target="",pin_memory=False, auto_allocate_layers = True,  cuda_streams=False, cpu_threading=False):
+                                 cast_target="",using_lora=True, pin_memory=False, auto_allocate_layers = True,  cuda_streams=False, cpu_threading=False):
 
         global gpu_resident_layers, cpu_swappable_layers, device_cache, pending_pin
         initial_gpu_layers = 0
@@ -1203,12 +1249,12 @@ class DynamicSwappingLoader:
                         except Exception:
                             pass
 
-                    # drop master refs so Python can GC them
-                    for attr in ('_cpu_params', '_cpu_buffers'):
+                    for attr in ('_cpu_params', '_cpu_buffers', '_cpu_master_data', '_gpu_slots',
+                                 '_dgls_swappable_ready'):
                         if hasattr(layer, attr):
                             try:
                                 delattr(layer, attr)
-                            except Exception:
+                            except:
                                 pass
 
             # Kill thread pool unconditionally
@@ -1228,7 +1274,21 @@ class DynamicSwappingLoader:
                     except:
                         pass
 
-            # _final_cuda_sweep_all_layers()
+            try:
+
+                # Force unload all models (including LoRA)
+                for model in comfy.model_management.loaded_models():
+                    if hasattr(model, 'patches') and model.patches:
+                        model.patches.clear()
+                    if hasattr(model, 'hook_patches') and model.hook_patches:
+                        model.hook_patches.clear()
+
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+
+            except Exception as e:
+                print(f"LoRA cleanup failed: {e}")
 
             if args.verbose:
                 if layers is not None:
@@ -1302,6 +1362,7 @@ class DynamicSwappingLoader:
         args.auto_allocate_layers = auto_allocate_layers
         args.pin_memory = pin_memory
         should_pin = args.pin_memory
+        args.using_lora = using_lora
 
         args.gpu_layers = gpu_layer_indices.strip() if gpu_layer_indices.strip() else None
         args.cast_target = cast_target.strip() if cast_target.strip() else None
@@ -1424,7 +1485,7 @@ class DynamicSwappingLoader:
                     print("Example usage: --gpu_layers 0,1,2,14,18,19,20,21,22")
                     raise e
             elif args.auto_allocate_layers:
-                specified_gpu_layers = calculate_auto_gpu_layers(layers, args)
+                specified_gpu_layers = calculate_auto_gpu_layers(layers, args, model)
 
             else: #CODE SHOULD BBE NOW UNREACHABLE- ONLY AUTO OR YOU PICK YOUR OWN INDICES
                 specified_gpu_layers = None
@@ -1434,77 +1495,6 @@ class DynamicSwappingLoader:
             # Clear sets to prevent double-addition from previous runs
             gpu_resident_layers.clear()
             cpu_swappable_layers.clear()
-
-            # PHASE 1: Determine which layers go where based on specified layers or initial/final counts
-            # for i, layer in enumerate(layers):
-            #     if hasattr(layer, 'to'):
-            #         if specified_gpu_layers is not None:
-            #             # Use specified layer indices for GPU placement
-            #             if i in specified_gpu_layers:
-            #                 try:
-            #                     layer.to(GPU_DEVICE)
-            #                     gpu_resident_layers.add(i)  # This is correct - after successful move
-            #                     if args.verbose:
-            #                         print(f"Layer {i} (specified) -> GPU permanent")
-            #
-            #                 except RuntimeError as e:
-            #                     print(f"CRITICAL: Cannot fit specified layer {i} on GPU!")
-            #                     print(f"GPU memory may be insufficient. Consider removing layer {i} from --gpu_layers")
-            #                     raise e
-            #             else:
-            #                 # Not in specified list, make swappable
-            #                 layer.to(CPU_DEVICE)
-            #                 if args.pin_memory:
-            #
-            #                     pending_pin = locals().get("pending_pin", set())
-            #                     pending_pin.add(i)
-            #                 if not hasattr(layer, '_cpu_params'):
-            #                     layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
-            #                     layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
-            #                 cpu_swappable_layers.add(i)
-            #                 if args.verbose:
-            #                     print(f"Layer {i} (not specified) -> CPU swappable")
-            #         else:
-            #             # Use original initial/final logic as fallback
-            #             if i < initial_gpu_layers:
-            #                 # Initial layers on GPU permanently
-            #                 try:
-            #                     layer.to(GPU_DEVICE)
-            #                     gpu_resident_layers.add(i)
-            #                     if args.verbose:
-            #                         print(f"Layer {i} (initial) -> GPU permanent")
-            #                 except RuntimeError as e:
-            #                     print(f"GPU exhausted at layer {i}, moving to CPU with swapping")
-            #                     layer.to(CPU_DEVICE)
-            #                     if args.pin_memory:
-            #                         pending_pin = locals().get("pending_pin", set())
-            #                         pending_pin.add(i)
-            #                     if not hasattr(layer, '_cpu_params'):
-            #                         layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
-            #                         layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
-            #                     cpu_swappable_layers.add(i)
-            #             elif i >= (len(layers) - final_gpu_layers):
-            #                 # Final layers on GPU permanently
-            #                 try:
-            #                     layer.to(GPU_DEVICE)
-            #                     gpu_resident_layers.add(i)
-            #                     if args.verbose:
-            #                         print(f"Layer {i} (final) -> GPU permanent")
-            #                 except RuntimeError as e:
-            #                     print(f"CRITICAL: Cannot fit final layer {i} on GPU!")
-            #                     raise e
-            #             else:
-            #                 # Middle layers on CPU with swapping capability
-            #                 layer.to(CPU_DEVICE)
-            #                 if args.pin_memory:
-            #                     pending_pin = locals().get("pending_pin", set())
-            #                     pending_pin.add(i)
-            #                 if not hasattr(layer, '_cpu_params'):
-            #                     layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
-            #                     layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
-            #                 cpu_swappable_layers.add(i)
-            #                 if args.verbose:
-            #                     print(f"Layer {i} (middle) -> CPU swappable")
 
             # PHASE 1: Determine which layers go where based on specified layers or initial/final counts
             for i, layer in enumerate(layers):
@@ -1526,28 +1516,13 @@ class DynamicSwappingLoader:
                     else:
                         # --- SWAPPABLE: buffers on GPU, params master on CPU (one-time) ---
                         # move whole module to GPU to keep BUFFERS there
-                        layer.to(GPU_DEVICE)
+                        # layer.to(GPU_DEVICE)
+                        _move_buffers_only(layer, GPU_DEVICE)
 
                         # one-time CPU masters for every PARAM (no new Parameter objects; rebind .data)
-                        if not hasattr(layer, '_cpu_master_data'):
-                            layer._cpu_master_data = {}
-                            with torch.no_grad():
-                                for pname, p in layer.named_parameters(recurse=True):
-                                    if p is None:
-                                        continue
-                                    cpu_master = p.data.to('cpu', copy=True)
-                                    if args.pin_memory:
-                                        try:
-                                            cpu_master = cpu_master.pin_memory()
-                                        except Exception:
-                                            pass
-                                    owner, leaf = _owner_and_key(layer, pname)
-                                    # owner._parameters[leaf].data = cpu_master  # module still owns same Parameter
-                                    _reassign_param(owner, leaf, cpu_master)
-                                    layer._cpu_master_data[pname] = cpu_master
 
                         # keep compatibility with your teardown/pin code
-                        if not hasattr(layer, '_cpu_params'):
+                        if args.pin_memory and not hasattr(layer, '_cpu_params'):
                             layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
                             layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
 
@@ -1572,24 +1547,9 @@ class DynamicSwappingLoader:
                             # couldn't keep resident; make it swappable instead
                             # try swappable layout with buffers on GPU
                             try:
-                                layer.to(GPU_DEVICE)
-                                # build CPU masters once
-                                if not hasattr(layer, '_cpu_master_data'):
-                                    layer._cpu_master_data = {}
-                                    with torch.no_grad():
-                                        for pname, p in layer.named_parameters(recurse=True):
-                                            if p is None:
-                                                continue
-                                            cpu_master = p.data.to('cpu', copy=True)
-                                            if args.pin_memory:
-                                                try:
-                                                    cpu_master = cpu_master.pin_memory()
-                                                except Exception:
-                                                    pass
-                                            owner, leaf = _owner_and_key(layer, pname)
-                                            # owner._parameters[leaf].data = cpu_master
-                                            _reassign_param(owner, leaf, cpu_master)
-                                            layer._cpu_master_data[pname] = cpu_master
+                                # layer.to(GPU_DEVICE)
+                                _move_buffers_only(layer, GPU_DEVICE)
+
                             except RuntimeError:
                                 # absolute fallback: leave everything on CPU for now
                                 layer.to(CPU_DEVICE)
@@ -1599,9 +1559,10 @@ class DynamicSwappingLoader:
                                         p is not None
                                     }
 
-                            if not hasattr(layer, '_cpu_params'):
+                            if args.pin_memory and not hasattr(layer, '_cpu_params'):
                                 layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
                                 layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
+
                             cpu_swappable_layers.add(i)
                             if args.pin_memory:
                                 pending_pin.add(i)
@@ -1620,26 +1581,10 @@ class DynamicSwappingLoader:
                             raise e
                     else:
                         # --- SWAPPABLE middle: buffers on GPU, params master on CPU (one-time) ---
-                        layer.to(GPU_DEVICE)
+                        # layer.to(GPU_DEVICE)
+                        _move_buffers_only(layer, GPU_DEVICE)
 
-                        if not hasattr(layer, '_cpu_master_data'):
-                            layer._cpu_master_data = {}
-                            with torch.no_grad():
-                                for pname, p in layer.named_parameters(recurse=True):
-                                    if p is None:
-                                        continue
-                                    cpu_master = p.data.to('cpu', copy=True)
-                                    if args.pin_memory:
-                                        try:
-                                            cpu_master = cpu_master.pin_memory()
-                                        except Exception:
-                                            pass
-                                    owner, leaf = _owner_and_key(layer, pname)
-                                    # owner._parameters[leaf].data = cpu_master
-                                    _reassign_param(owner, leaf, cpu_master)
-                                    layer._cpu_master_data[pname] = cpu_master
-
-                        if not hasattr(layer, '_cpu_params'):
+                        if args.pin_memory and not hasattr(layer, '_cpu_params'):
                             layer._cpu_params = {n: p for n, p in layer.named_parameters(recurse=True)}
                             layer._cpu_buffers = {n: b for n, b in layer.named_buffers(recurse=True)}
 
