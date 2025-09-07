@@ -10,7 +10,7 @@ This is still under development. I am actively bug testing this atm. It's fully 
 ## Features
 
 * **Drop‑in ComfyUI integration.** Adds two nodes under the **loaders** category: `DGLS Model Loader` and `DGLS Swapping Loader`.
-* **Architecture‑aware layer extraction.** Handles Cosmos, FLUX, WAN 2.1/2.2, HunyuanVideo, SD3‑style stacks, and generic transformer layouts.
+* **Architecture‑aware layer extraction.** Handles Cosmos, FLUX, WAN 2.1/2.2, HunyuanVideo, Qwen, and generic transformer layouts.
 * **Buffers‑on‑GPU / params‑on‑CPU design.** Small buffers remain on GPU; master parameter tensors live on CPU and are **rebound** to GPU storage just‑in‑time per layer (via an optimized `_reassign_param`), avoiding redundant cloning.
 * **Auto or manual GPU residency.** Leave it on **auto** (default) or pass an explicit comma‑separated `gpu_layer_indices` to pin chosen layers on GPU.
 * **Predictive prefetch.** Chooses the next `prefetch` layers in ring order; optional CUDA streams and a conservative CPU helper thread can overlap H2D copies with compute.
