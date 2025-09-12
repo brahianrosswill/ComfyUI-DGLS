@@ -24,7 +24,13 @@ This is still under development. I am actively bug testing this atm. It's fully 
 * **ComfyUI** (CUDA‑enabled PyTorch).
 * **GPU:** Any CUDA‑capable GPU.
 * **System RAM:** 32GB+ recommended if you plan to enable overlap/pinning. 16GB can work, 64GB+ is best.
-* **Currently only working with diffusion models: Any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm. 
+* **Currently only working with diffusion models: Any workflow with 'Load Diffusion Model' official node should be fine with this swapped for it. OmniGen not working atm.
+
+  ---
+
+## Updating (Custom Nodes)
+
+-- If update the node please recreate node through the menu to prevent comfy's cache system holding on to previous versions. 
 
 ---
 
