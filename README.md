@@ -30,7 +30,7 @@ This is still under development. I am actively bug testing this atm. It's fully 
 
 ## Updating (Custom Nodes)
 
--- If update the node please recreate node through the menu to prevent comfy's cache system holding on to previous versions. 
+-- If updating the node please recreate node through the menu to prevent comfy's cache system holding on to previous versions. 
 
 ---
 
