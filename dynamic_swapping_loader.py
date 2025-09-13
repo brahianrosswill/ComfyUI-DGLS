@@ -551,7 +551,7 @@ def calculate_auto_gpu_layers(layers, args, model_patcher=None):
     """Auto-select GPU layers allocation logic with safety mechanisms"""
 
     layer_overhead_mult = 1.1
-    overhead_ratio = 0.1
+    overhead_ratio = 0.25
     lora_mult = 1.5
     device = comfy.model_management.get_torch_device()
     reserve_lora = getattr(args, 'using_lora', False)
@@ -2315,3 +2315,4 @@ def print_memory_optimization_analysis(layers, args):
         # 'gpu_layers': list(gpu_layers) if available_for_layers else [],
         # 'swapping_overhead_gb': swapping_overhead / 1024 ** 3 if available_for_layers else 0
     }
+
