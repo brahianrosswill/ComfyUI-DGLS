@@ -1,6 +1,7 @@
 import comfy.sd
 import folder_paths
 import torch
+import torch.nn as nn
 from safetensors.torch import load_file
 import comfy.model_detection
 import gc
@@ -23,132 +24,247 @@ Universal diffusion model loader with layer extraction for memory optimization.
 Extracts computation layers from UNet/DiT architectures for dynamic GPU swapping.
 Supports Cosmos, Flux, Wan2.1, Wan2.2, HunyuanVideo, and generic transformer blocks.
 
-COMPATIBILITY: Diffusion models and UNets only. Not compatible with full checkpoints yett.
+COMPATIBILITY: Diffusion models and UNets only. Not compatible with full checkpoints yet.
 
 Author: obisin
 """
+
+# =============================================================================
+# FULL CAST SYSTEM by obisin
+# =============================================================================
+
+def _owner_and_key(root_module, dotted_name):
+    """Helper to find the owner module and key for a parameter/buffer"""
+    if "." not in dotted_name:
+        return root_module, dotted_name
+    owner_path, key = dotted_name.rsplit(".", 1)
+    owner = root_module
+    for part in owner_path.split("."):
+        owner = getattr(owner, part)
+    return owner, key
+
+class FullCastHandler:
+    def __init__(self):
+        self.dtype_map = {
+            'fp32': torch.float32,
+            'fp16': torch.float16,
+            'bf16': torch.bfloat16,
+            'fp8_e4m3': torch.float8_e4m3fn if hasattr(torch, 'float8_e4m3fn') else None,
+            'fp8_e5m2': torch.float8_e5m2 if hasattr(torch, 'float8_e5m2') else None,
+            'nf4': 'nf4',  # Special handling
+            'fp4': 'fp4'   # Special handling
+        }
+
+    def cast_model_to_dtype(self, model_patcher, target_dtype_str, verbose=False):
+        """Cast entire model to target dtype"""
+        if target_dtype_str == "disabled":
+            return model_patcher
+
+        target_dtype = self.dtype_map.get(target_dtype_str)
+        if target_dtype is None:
+            if verbose:
+                print(f"Unsupported target dtype: {target_dtype_str}")
+            return model_patcher
+
+        if verbose:
+            print(f"Full casting model to {target_dtype_str}...")
+
+        model = model_patcher.model
+
+        # Handle 4-bit quantization
+        if target_dtype_str in ['nf4', 'fp4']:
+            return self._cast_to_4bit(model_patcher, target_dtype_str, verbose)
+
+        # Regular dtype casting
+        casted_params = 0
+        casted_buffers = 0
+
+        with torch.inference_mode(False), torch.no_grad():
+            # Cast parameters in-place
+            for name, param in model.named_parameters(recurse=True):
+                if param is None or not torch.is_floating_point(param):
+                    continue
+
+                if param.dtype != target_dtype:
+                    param.data = param.data.to(dtype=target_dtype, device=param.device)
+                    casted_params += 1
+
+            # Cast buffers in-place
+            for name, buffer in model.named_buffers(recurse=True):
+                if buffer is None or not torch.is_floating_point(buffer):
+                    continue
+
+                # Keep batchnorm running stats in fp32 for stability
+                if name.endswith("running_mean") or name.endswith("running_var"):
+                    continue
+
+                if buffer.dtype != target_dtype:
+                    buffer.data = buffer.data.to(dtype=target_dtype, device=buffer.device)
+                    casted_buffers += 1
+
+        if verbose:
+            print(f"✓ Full cast complete: {casted_params} parameters, {casted_buffers} buffers cast to {target_dtype_str}")
+
+        return model_patcher
+
+    def _cast_to_4bit(self, model_patcher, quant_type, verbose=False):
+        """Cast model to 4-bit quantization using bitsandbytes"""
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise RuntimeError("bitsandbytes required for 4-bit quantization. Install with: pip install bitsandbytes")
+
+        if verbose:
+            print(f"Applying 4-bit quantization ({quant_type})...")
+
+        model = model_patcher.model
+        quantized_params = 0
+
+        with torch.inference_mode(False), torch.no_grad():
+            for name, param in model.named_parameters(recurse=True):
+                if param is None or not torch.is_floating_point(param):
+                    continue
+
+                try:
+                    # Quantize and immediately dequantize in-place
+                    quantized, quant_state = bnb.functional.quantize_4bit(
+                        param.data, blocksize=64, quant_type=quant_type
+                    )
+                    param.data = bnb.functional.dequantize_4bit(quantized, quant_state)
+                    quantized_params += 1
+
+                except Exception as e:
+                    if verbose:
+                        print(f"Failed to quantize {name}: {e}")
+                    continue
+
+        if verbose:
+            print(f"✓ 4-bit quantization complete: {quantized_params} parameters quantized with {quant_type}")
+
+        return model_patcher
 
 # =============================================================================
 # EXTRACTION by obisin
 # =============================================================================
 
 def extract_layers_from_comfy_model(model_patcher, verbose):
-    """Extract ComfyUI's layers from different model architectures"""
+    """Vectorized layer extraction with optimized single-pass detection"""
 
-    if hasattr(model_patcher.model, 'diffusion_model'):
-        dm = model_patcher.model.diffusion_model
+    if not hasattr(model_patcher.model, 'diffusion_model'):
+        if verbose:
+            print(" No diffusion_model found")
+        return []
 
-        layers = []
+    dm = model_patcher.model.diffusion_model
 
-        # Method 1: Standard blocks (WAN, SDXL, etc.)
-        if hasattr(dm, 'blocks') and len(dm.blocks) > 0:
-            for i, block in enumerate(dm.blocks):
-                layers.append(block)
-            print(f"Extracted {len(layers)} blocks from diffusion model")
-            return layers
+    # Priority-ordered layer attributes (most common architectures first)
+    primary_attrs = [
+        ('blocks', 'Standard blocks (WAN, SDXL, etc.)'),
+        ('double_blocks', 'Flux DiT double_blocks'),
+        ('single_blocks', 'Flux DiT single_blocks'), 
+        ('joint_blocks', 'SD3 DiT joint_blocks'),
+        ('transformer_blocks', 'Generic DiT transformer_blocks')
+    ]
 
-        # Method 2: Flux DiT layers (double_blocks + single_blocks)
-        if hasattr(dm, 'double_blocks') or hasattr(dm, 'single_blocks'):
-            if hasattr(dm, 'double_blocks'):
-                for i, block in enumerate(dm.double_blocks):
-                    layers.append(block)
-                    # Debug: Check the forward signature
-                    import inspect
-                    sig = inspect.signature(block.forward)
-                print(f"Added {len(dm.double_blocks)} double_blocks")
+    # Single pass extraction for primary attributes
+    found_layers = []
+    found_sources = []
 
-            if hasattr(dm, 'single_blocks'):
-                for i, block in enumerate(dm.single_blocks):
-                    layers.append(block)
-                print(f"Added {len(dm.single_blocks)} single_blocks")
+    for attr_name, description in primary_attrs:
+        if hasattr(dm, attr_name):
+            attr = getattr(dm, attr_name)
+            if attr and len(attr) > 0:
+                # Direct list conversion instead of enumeration loop
+                layer_list = list(attr)
+                if layer_list:
+                    found_layers.extend(layer_list)
+                    found_sources.append(f"{len(layer_list)} {attr_name}")
 
-            print(f"Extracted {len(layers)} Flux DiT layers")
-            return layers
+    # Special case: HunyuanVideo (both blocks and single_blocks)
+    if (hasattr(dm, 'blocks') and hasattr(dm, 'single_blocks') and 
+        not found_layers):  # Only if nothing found yet
+        blocks = list(dm.blocks) if dm.blocks else []
+        single_blocks = list(dm.single_blocks) if dm.single_blocks else []
+        if blocks or single_blocks:
+            found_layers.extend(blocks + single_blocks)
+            found_sources.append(f"HunyuanVideo: {len(blocks)} blocks + {len(single_blocks)} single_blocks")
 
-        # Method 3: SD3 DiT layers
-        if hasattr(dm, 'joint_blocks'):
-            for i, block in enumerate(dm.joint_blocks):
-                layers.append(block)
-            print(f"Extracted {len(layers)} SD3 joint_blocks")
-            return layers
+    if found_layers:
+        if verbose:
+            print(f"Extracted {len(found_layers)} layers from: {', '.join(found_sources)}")
+        return found_layers
 
-        # Method 4: HunyuanVideo layers
-        if hasattr(dm, 'blocks') and hasattr(dm, 'single_blocks'):
-            # HunyuanVideo has both blocks and single_blocks
-            for i, block in enumerate(dm.blocks):
-                layers.append(block)
-            for i, block in enumerate(dm.single_blocks):
-                layers.append(block)
-            print(f"Extracted {len(layers)} HunyuanVideo layers (blocks + single_blocks)")
-            return layers
+    # Fast fallback using dir() filtering instead of individual hasattr calls
+    fallback_attrs = [name for name in dir(dm) 
+                     if not name.startswith('_') and 
+                     any(keyword in name.lower() for keyword in 
+                         ['layer', 'block', 'encoder', 'decoder', 'module'])]
 
-        # Method 5: Transformer layers (generic DiT models)
-        if hasattr(dm, 'transformer_blocks'):
-            for i, block in enumerate(dm.transformer_blocks):
-                layers.append(block)
-            print(f"Extracted {len(layers)} transformer_blocks")
-            return layers
+    for attr_name in fallback_attrs:
+        try:
+            attr = getattr(dm, attr_name, None)
+            if hasattr(attr, '__iter__') and not isinstance(attr, (str, torch.nn.Parameter)):
+                # Vectorized module filtering
+                modules = [item for item in attr if isinstance(item, torch.nn.Module)]
+                if modules:
+                    if verbose:
+                        print(f"Extracted {len(modules)} layers from {attr_name}")
+                    return modules
+        except:
+            continue
 
-        # Method 6: Generic layer extraction by common names
-        layer_names = ['layers', 'encoders', 'decoders', 'blocks', 'modules']
-        for attr_name in layer_names:
-            if hasattr(dm, attr_name):
-                attr = getattr(dm, attr_name)
-                if hasattr(attr, '__iter__') and not isinstance(attr, str):
-                    try:
-                        for i, block in enumerate(attr):
-                            if isinstance(block, torch.nn.Module):
-                                layers.append(block)
-                        if layers:
-                            print(f"Extracted {len(layers)} layers from {attr_name}")
-                            return layers
-                    except:
-                        continue
+    # Final fallback: named_children with pattern matching
+    skip_modules = {'input_layer', 'output_layer', 'norm', 'embedding', 'pos_embed', 'patch_embed'}
+    pattern_keywords = {'block', 'layer', 'transformer', 'attention', 'mlp'}
+    
+    fallback_layers = []
+    for name, module in dm.named_children():
+        if (isinstance(module, torch.nn.Module) and 
+            name not in skip_modules and
+            any(keyword in name.lower() for keyword in pattern_keywords)):
+            
+            # Check if it's a container of blocks
+            if hasattr(module, '__iter__') and not isinstance(module, torch.nn.Parameter):
+                try:
+                    sub_modules = [sub for sub in module if isinstance(sub, torch.nn.Module)]
+                    fallback_layers.extend(sub_modules)
+                except:
+                    fallback_layers.append(module)
+            else:
+                fallback_layers.append(module)
 
-        # Method 7: Search for block-like modules
-        for name, module in dm.named_children():
-            if isinstance(module, torch.nn.Module):
-                # Look for modules that are likely to be computation blocks
-                if any(keyword in name.lower() for keyword in ['block', 'layer', 'transformer', 'attention', 'mlp']):
-                    # Check if it's a container of blocks or a single block
-                    if hasattr(module, '__iter__') and not isinstance(module, torch.nn.Parameter):
-                        try:
-                            for sub_module in module:
-                                if isinstance(sub_module, torch.nn.Module):
-                                    layers.append(sub_module)
-                        except:
-                            layers.append(module)
-                    else:
-                        layers.append(module)
+    if fallback_layers:
+        if verbose:
+            print(f"Extracted {len(fallback_layers)} layers using pattern matching")
+        return fallback_layers
 
-        if layers:
-            print(f"Extracted {len(layers)} layers using pattern matching")
-            return layers
-
-        # Method 8: Last resort - extract all meaningful modules
-        print(" Using fallback: extracting all major modules")
-        skip_modules = ['input_layer', 'output_layer', 'norm', 'embedding', 'pos_embed', 'patch_embed']
-        for name, module in dm.named_children():
-            if isinstance(module, torch.nn.Module) and name not in skip_modules:
-                layers.append(module)
+    # Last resort: all meaningful modules
+    if verbose:
+        print(" Using final fallback: extracting all major modules")
+    
+    final_layers = []
+    for name, module in dm.named_children():
+        if isinstance(module, torch.nn.Module) and name not in skip_modules:
+            final_layers.append(module)
+            if verbose:
                 print(f"  Added module: {name} ({type(module).__name__})")
 
-        if layers:
-            print(f"Extracted {len(layers)} modules using fallback method")
-            return layers
-        else:
-            print(" No layers found in diffusion model")
-            # Debug: show what's available
-            print("Available attributes:")
-            for name in dir(dm):
-                if not name.startswith('_') and hasattr(dm, name):
-                    attr = getattr(dm, name)
-                    if isinstance(attr, (torch.nn.Module, torch.nn.ModuleList, list)):
-                        print(f"  {name}: {type(attr)}")
-            return []
-    else:
-        print(" No diffusion_model found")
-        return []
+    if final_layers:
+        if verbose:
+            print(f"Extracted {len(final_layers)} modules using final fallback")
+        return final_layers
+
+    # Debug information only if verbose
+    if verbose:
+        print(" No layers found in diffusion model")
+        print("Available attributes:")
+        for name in dir(dm):
+            if not name.startswith('_'):
+                attr = getattr(dm, name, None)
+                if isinstance(attr, (torch.nn.Module, torch.nn.ModuleList, list)):
+                    print(f"  {name}: {type(attr)}")
+    
+    return []
 
 
 def add_to_layers_method(model_patcher,verbose):
@@ -175,11 +291,13 @@ class DGLSModelLoader:
             "required": {
                 "model_name": (model_list, {"default": model_list[0] if model_list else ""}),
                 "model_type": (["default", "hunyuan", "unet"], {"default": "default", "tooltip": "Unet is just for Debugging, its a legacy loader- Use default"}),
-                "cast_dtype": (["default", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],{"default": "default"}),
+                "cast_dtype": (["default", "disabled", "fp32", "fp16", "bf16", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],{"default": "default", "tooltip": "ComfyUI casting system. Use 'disabled' to turn off ComfyUI casting and use full_cast instead"}),
+                "full_cast": (["disabled", "fp32", "fp16", "bf16", "fp8_e4m3", "fp8_e5m2", "nf4", "fp4"], {"default": "disabled", "tooltip": "Full cast system - cast entire model to target dtype including fp4. Works independently of ComfyUI's system. Only cast in f8 or f4 if you have the kernals for it."}),
                 "clear_model_cache": ("BOOLEAN", {"default": False, "tooltip": "Force reload model from disk, ignoring ComfyUI's model cache"}),
-                "verbose": ("BOOLEAN", {"default": False}),
+                "verbose": ("BOOLEAN", {"default": False, "tooltip": "This will slow down inference"}),
             },
-            "optional": {"nuke_all_caches": ("BOOLEAN", {"default": False, "tooltip": "CAUTION: Aggressive Clear all ComfyUI caches"}),
+            "optional": {
+                "nuke_all_caches": ("BOOLEAN", {"default": False, "tooltip": "CAUTION: Aggressive Clear all ComfyUI caches"}),
                 # "custom_ckpt_path": ("STRING", {"default": ""}),
             }
         }
@@ -190,7 +308,7 @@ class DGLSModelLoader:
     CATEGORY = "loaders"
     TITLE = "DGLS Model Loader"
 
-    def load_dgls_model(self, model_name, model_type, cast_dtype,  verbose, clear_model_cache, nuke_all_caches=False, custom_ckpt_path="", override_model_type="auto"):
+    def load_dgls_model(self, model_name, model_type, cast_dtype, full_cast, verbose, clear_model_cache, nuke_all_caches=False, custom_ckpt_path="", override_model_type="auto"):
 
         self.verbose = verbose
         # Cache clearing logic
@@ -210,13 +328,17 @@ class DGLSModelLoader:
         if verbose:
             print(f"Loading model using DGLS loader...")
             print(f"Model path: {model_path}")
-            print(f"Weight dtype: {cast_dtype}")
+            print(f"ComfyUI cast dtype: {cast_dtype}")
+            print(f"Full cast dtype: {full_cast}")
             print(f"Override model type: {override_model_type}")
 
 
         # Set up model options for dtype control
         model_options = {}
-        if cast_dtype == "fp32":
+        if cast_dtype == "disabled":
+            # Disable ComfyUI's casting system completely
+            model_options = {}
+        elif cast_dtype == "fp32":
             model_options["dtype"] = torch.float32
         elif cast_dtype == "fp16":
             model_options["dtype"] = torch.float16
@@ -268,6 +390,13 @@ class DGLSModelLoader:
         # fixed = self.normalize_inference_params(model_patcher, verbose=verbose)
         # model_patcher = self.normalize_inference_model_patcher(model_patcher)
 
+        # Apply full cast system if enabled
+        if full_cast != "disabled":
+            if verbose:
+                print(f"Applying full cast to {full_cast}...")
+            full_cast_handler = FullCastHandler()
+            model_patcher = full_cast_handler.cast_model_to_dtype(model_patcher, full_cast, verbose=verbose)
+
         model_patcher = add_to_layers_method(model_patcher, verbose=verbose)
         layers = model_patcher.to_layers()
         if verbose:
@@ -295,7 +424,7 @@ class DGLSModelLoader:
                         comfy.utils.set_attr_param(
                             model_patcher.model,
                             name,
-                            param.data.clone())
+                            param.data)#.clone()
         return model_patcher
 
     def normalize_inference_model_patcher(self, model_patcher, verbose=False, attr_names=None):
@@ -462,6 +591,12 @@ class DGLSModelLoader:
         torch.cuda.empty_cache()
         gc.collect()
         torch.cuda.synchronize()
+        
+        # CUDA IPC cleanup - complements GPU cleanup
+        try:
+            torch.cuda.ipc_collect()  # Clear CUDA IPC memory handles
+        except Exception:
+            pass  # Graceful fallback if IPC collect fails
 
         if hasattr(self, 'verbose') and self.verbose:
             print("✓ Model cache cleared safely")
