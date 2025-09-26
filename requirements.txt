@@ -6,6 +6,3 @@ safetensors>=0.3.0
 # Memory management and system utilities
 psutil>=5.9.0
 bitsandbytes>=0.41.0
-
-# Concurrency
-concurrent.futures
